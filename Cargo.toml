@@ -1,6 +1,27 @@
-[package]
-name = "nt-dex-adapters"
+[workspace]
+resolver = "3"
+members = [
+    "crates/aster",
+    "crates/edgex",
+    "crates/extended",
+    "crates/grvt",
+    "bins/node",
+]
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.99.1"
+publish = false
 
-[dependencies]
+[workspace.dependencies]
+# NautilusTrader v2.0.0rc9
+nautilus-binance = "=0.68.0"
+nautilus-common = { version = "=0.68.0", features = ["live"] }
+nautilus-core = "=0.68.0"
+nautilus-hyperliquid = "=0.68.0"
+nautilus-lighter = "=0.68.0"
+nautilus-live = { version = "=0.68.0", default-features = false, features = ["streaming"] }
+nautilus-model = { version = "=0.68.0", features = ["high-precision"] }
+nautilus-network = { version = "=0.68.0", features = ["transport-sockudo"] }
+nautilus-persistence = "=0.68.0"
