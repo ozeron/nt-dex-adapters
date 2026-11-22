@@ -1,0 +1,26 @@
+[
+  {
+    "id": 150490379,
+    "price": "60684.1",
+    "qty": "0.001",
+    "quoteQty": "60.6",
+    "time": 1795375994250,
+    "isBuyerMaker": true
+  },
+  {
+    "id": 150490380,
+    "price": "60681.9",
+    "qty": "0.352",
+    "quoteQty": "21360.0",
+    "time": 1795376002400,
+    "isBuyerMaker": false
+  },
+  {
+    "id": 150490381,
+    "price": "60683.1",
+    "qty": "0.244",
+    "quoteQty": "14806.6",
+    "time": 1795376022000,
+    "isBuyerMaker": true
+  }
+]

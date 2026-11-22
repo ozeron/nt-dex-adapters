@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/aster",
     "bins/node",
+    "tools/capture",
 ]
 # Bare `cargo check` / `cargo test` touch only the venue under development.
 # Use `--workspace` (or `scripts/gate.sh`) to include the node.
@@ -27,6 +28,7 @@ nautilus-live = { version = "=0.68.0", default-features = false }
 nautilus-model = { version = "=0.68.0", features = ["high-precision"] }
 nautilus-network = { version = "=0.68.0", features = ["transport-sockudo"] }
 nautilus-persistence = "=0.68.0"
+nautilus-testkit = { version = "=0.68.0", features = ["testers"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -63,8 +65,11 @@ undocumented_unsafe_blocks = "warn"
 [profile.dev]
 debug = "line-tables-only"
 
+# Dependencies are optimised: they compile once, and replaying a capture
+# through unoptimised serde and decimal code is several times slower.
 [profile.dev.package."*"]
 debug = false
+opt-level = 2
 
 # Opt-in full debug info for a debugger session: `cargo build --profile debugging`.
 [profile.debugging]

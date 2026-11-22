@@ -48,6 +48,8 @@ license-files = []
 # Duplicate versions come from NautilusTrader's own tree; not ours to fix.
 multiple-versions = "allow"
 wildcards = "deny"
+# Path dependencies between our own unpublished crates carry no version.
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"

@@ -6,11 +6,18 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+anyhow = "1"
+log = "0.4"
+nautilus-common.workspace = true
+nautilus-core.workspace = true
 nautilus-binance.workspace = true
 nautilus-hyperliquid.workspace = true
 nautilus-lighter.workspace = true
 nautilus-live = { workspace = true, features = ["streaming"] }
+nautilus-model.workspace = true
 nautilus-persistence.workspace = true
+nt-dex-aster = { path = "../../crates/aster" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 
 [lints]
 workspace = true
