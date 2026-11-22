@@ -51,7 +51,10 @@ use nt_dex_aster::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
-    sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+    sync::{
+        mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+        oneshot,
+    },
 };
 use tokio_tungstenite::tungstenite::Message;
 
@@ -83,6 +86,7 @@ struct Connection {
 struct State {
     exchange_info: String,
     snapshot_update_id: u64,
+    pause_next_snapshot: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
     http_requests: Vec<String>,
     connections: Vec<Connection>,
     /// Every `SUBSCRIBE` and `UNSUBSCRIBE`: connection, method, streams.
@@ -91,6 +95,8 @@ struct State {
     oversized: usize,
     /// Streams whose next `SUBSCRIBE` is answered with an error.
     refuse_once: BTreeSet<String>,
+    /// Signals that a connection was accepted, then waits before upgrading it.
+    pause_next_handshake: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
 }
 
 impl State {
@@ -114,11 +120,13 @@ impl Venue {
         let state = Arc::new(Mutex::new(State {
             exchange_info: EXCHANGE_INFO.to_owned(),
             snapshot_update_id: 0,
+            pause_next_snapshot: None,
             http_requests: Vec::new(),
             connections: Vec::new(),
             control: Vec::new(),
             oversized: 0,
             refuse_once: BTreeSet::new(),
+            pause_next_handshake: None,
         }));
 
         let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -266,10 +274,10 @@ async fn serve_http(mut socket: tokio::net::TcpStream, state: Arc<Mutex<State>>)
         .nth(1)
         .unwrap_or_default()
         .to_owned();
-    let body = {
+    let (body, pause) = {
         let mut state = state.lock().unwrap();
         state.http_requests.push(path.clone());
-        if path.starts_with("/fapi/v1/exchangeInfo") {
+        let body = if path.starts_with("/fapi/v1/exchangeInfo") {
             state.exchange_info.clone()
         } else if path.starts_with("/fapi/v1/fundingInfo") {
             FUNDING_INFO.to_owned()
@@ -283,8 +291,18 @@ async fn serve_http(mut socket: tokio::net::TcpStream, state: Arc<Mutex<State>>)
                 .to_owned()
         } else {
             "{}".to_owned()
-        }
+        };
+        let pause = if path.starts_with("/fapi/v1/depth") {
+            state.pause_next_snapshot.take()
+        } else {
+            None
+        };
+        (body, pause)
     };
+    if let Some((received, resume)) = pause {
+        let _ = received.send(());
+        let _ = resume.await;
+    }
     let response = format!(
         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
          connection: close\r\n\r\n{body}",
@@ -295,6 +313,11 @@ async fn serve_http(mut socket: tokio::net::TcpStream, state: Arc<Mutex<State>>)
 }
 
 async fn serve_ws(socket: tokio::net::TcpStream, state: Arc<Mutex<State>>) {
+    let pause = state.lock().unwrap().pause_next_handshake.take();
+    if let Some((accepted, resume)) = pause {
+        let _ = accepted.send(());
+        let _ = resume.await;
+    }
     let Ok(stream) = tokio_tungstenite::accept_async(socket).await else {
         return;
     };
@@ -354,8 +377,9 @@ async fn serve_ws(socket: tokio::net::TcpStream, state: Arc<Mutex<State>>) {
                         refused
                     };
                     let reply = if refused {
+                        // The word "stream" in a reply value is not a stream key.
                         format!(
-                            r#"{{"error":{{"code":2,"msg":"Invalid request"}},"id":{}}}"#,
+                            r#"{{"error":{{"code":2,"msg":"stream"}},"id":{}}}"#,
                             request["id"]
                         )
                     } else {
@@ -644,6 +668,47 @@ fn connect_publishes_instruments_and_streams_trades_and_quotes() {
 }
 
 #[test]
+fn connecting_after_stop_waits_for_the_old_session() {
+    run(async {
+        let mut harness = Harness::start(|config| config.max_streams_per_connection = 1).await;
+        let (accepted, pending) = oneshot::channel();
+        let (resume, paused) = oneshot::channel();
+        harness.venue.state.lock().unwrap().pause_next_handshake = Some((accepted, paused));
+        harness.subscribe_trades(&["BTCUSDT", "SOLUSDT"]);
+        tokio::time::timeout(TIMEOUT, pending)
+            .await
+            .unwrap()
+            .unwrap();
+
+        harness.client.stop().unwrap();
+        assert!(harness.client.is_disconnected());
+        assert!(harness.try_subscribe_trades(&["BTCUSDT"]).is_err());
+
+        {
+            let restart = harness.client.connect();
+            tokio::pin!(restart);
+            assert!(
+                tokio::time::timeout(Duration::from_secs(1), &mut restart)
+                    .await
+                    .is_err(),
+                "connect returned while the old session was still opening a socket"
+            );
+            resume.send(()).unwrap();
+            tokio::time::timeout(TIMEOUT, restart)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        assert!(harness.client.is_connected());
+        harness.subscribe_trades(&["SOLUSDT"]);
+        harness.venue.push(&trade_frame("SOLUSDT", 100)).await;
+        assert_eq!(harness.next("trade", trade).await, instrument_id("SOLUSDT"));
+        harness.stop().await;
+    });
+}
+
+#[test]
 fn unsubscribed_data_is_not_published() {
     run(async {
         let mut harness = Harness::start(|_| {}).await;
@@ -758,6 +823,64 @@ fn book_syncs_from_a_snapshot_and_resyncs_after_a_gap() {
 }
 
 #[test]
+fn recovery_budget_discards_old_diffs_and_keeps_one_snapshot_in_flight() {
+    run(async {
+        let mut harness = Harness::start(|config| config.book_buffer_bytes = 0).await;
+        harness.subscribe_book(&["SOLUSDT"]);
+        harness.subscribe_trades(&["SOLUSDT"]);
+        let (ready, started) = oneshot::channel();
+        let (resume, paused) = oneshot::channel();
+        {
+            let mut state = harness.venue.state.lock().unwrap();
+            state.snapshot_update_id = 1_000;
+            state.pause_next_snapshot = Some((ready, paused));
+        }
+        harness.venue.push(&depth_diff(990, 1_005, 980)).await;
+        tokio::time::timeout(TIMEOUT, started)
+            .await
+            .unwrap()
+            .unwrap();
+        harness.venue.push(&depth_diff(1_006, 1_010, 1_005)).await;
+        harness.venue.push(&trade_frame("SOLUSDT", 100)).await;
+        harness.next("trade after the buffered diffs", trade).await;
+        assert_eq!(harness.venue.requests("/fapi/v1/depth"), 1);
+
+        harness.venue.state.lock().unwrap().snapshot_update_id = 1_010;
+        resume.send(()).unwrap();
+        assert_eq!(harness.next("covering snapshot", book).await, (1_010, true));
+        assert_eq!(harness.venue.requests("/fapi/v1/depth"), 2);
+        harness.venue.push(&depth_diff(1_011, 1_015, 1_010)).await;
+        assert_eq!(harness.next("linked diff", book).await, (1_015, false));
+        harness.stop().await;
+    });
+}
+
+#[test]
+fn stalled_trade_consumer_receives_the_full_burst_in_order() {
+    const TRADES: usize = 256;
+    run(async {
+        let mut harness = Harness::start(|_| {}).await;
+        while harness.events.try_recv().is_ok() {}
+        harness.subscribe_trades(&["SOLUSDT"]);
+        let slot = harness.venue.wait_for_stream("solusdt@trade").await;
+        for id in 0..u64::try_from(TRADES).unwrap() {
+            harness.venue.push_on(slot, &trade_frame("SOLUSDT", id));
+        }
+        tokio::time::timeout(TIMEOUT, async {
+            while harness.events.len() < TRADES {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("all trades queued while the consumer was stalled");
+        for id in 0..TRADES {
+            assert_eq!(harness.next("queued trade", trade_id).await, id.to_string());
+        }
+        harness.stop().await;
+    });
+}
+
+#[test]
 fn reconnect_resubscribes_and_resyncs_the_book() {
     run(async {
         let mut harness = Harness::start(|_| {}).await;
@@ -799,6 +922,51 @@ fn reconnect_resubscribes_and_resyncs_the_book() {
             harness.next("diff after reconnect", book).await,
             (1_010, false)
         );
+        assert_eq!(harness.venue.requests("/fapi/v1/depth"), 2);
+        harness.stop().await;
+    });
+}
+
+#[test]
+fn reconnect_retires_an_in_flight_snapshot_before_starting_a_new_book() {
+    run(async {
+        let mut harness = Harness::start(|_| {}).await;
+        harness.subscribe_book(&["SOLUSDT"]);
+        let old_slot = harness.venue.wait_for_stream("solusdt@depth@100ms").await;
+        let (received, started) = oneshot::channel();
+        let (resume, paused) = oneshot::channel();
+        {
+            let mut state = harness.venue.state.lock().unwrap();
+            state.snapshot_update_id = 1_000;
+            state.pause_next_snapshot = Some((received, paused));
+        }
+        harness
+            .venue
+            .push_on(old_slot, &depth_diff(990, 1_005, 980));
+        tokio::time::timeout(TIMEOUT, started)
+            .await
+            .unwrap()
+            .unwrap();
+        harness.venue.drop_connection(old_slot).await;
+        let new_slot = harness.venue.wait_for_stream("solusdt@depth@100ms").await;
+        assert_ne!(old_slot, new_slot);
+
+        harness.venue.state.lock().unwrap().snapshot_update_id = 2_000;
+        harness
+            .venue
+            .push_on(new_slot, &depth_diff(1_990, 2_005, 1_980));
+        assert_eq!(
+            harness.next("new generation snapshot", book).await,
+            (2_000, true)
+        );
+        assert_eq!(
+            harness.next("new generation diff", book).await,
+            (2_005, false)
+        );
+        resume.send(()).unwrap();
+        harness
+            .expect_none("retired snapshot", |event| book(event).is_some())
+            .await;
         assert_eq!(harness.venue.requests("/fapi/v1/depth"), 2);
         harness.stop().await;
     });

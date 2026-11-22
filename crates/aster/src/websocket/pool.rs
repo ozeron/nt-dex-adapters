@@ -14,7 +14,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -62,9 +62,37 @@ struct ControlReply {
 
 struct Slot {
     socket: WebSocketClient,
-    /// Counts this connection's reconnects, as they happen on the socket.
-    reconnects: Arc<AtomicU64>,
+    reconnects: ReconnectEpoch,
     streams: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct ReconnectEpoch {
+    /// Advanced in the socket callback before the marker enters the frame queue.
+    received: Arc<AtomicU64>,
+    /// Advanced on the session task as it processes each reconnect marker.
+    consumed: u64,
+}
+
+impl ReconnectEpoch {
+    fn fence(&self) -> ReconnectFence {
+        ReconnectFence {
+            received: Arc::clone(&self.received),
+            epoch: self.consumed,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ReconnectFence {
+    received: Arc<AtomicU64>,
+    epoch: u64,
+}
+
+impl ReconnectFence {
+    pub(crate) fn is_current(&self) -> bool {
+        self.received.load(Ordering::Acquire) == self.epoch
+    }
 }
 
 /// Splits `streams` into runs that each fit one control message.
@@ -95,6 +123,7 @@ pub(crate) struct StreamPool {
     max_connections: usize,
     slots: Vec<Slot>,
     frames: UnboundedSender<PoolFrame>,
+    frame_bytes: Arc<AtomicUsize>,
     clock: &'static AtomicTime,
     control_key: [Ustr; 1],
     next_request_id: u64,
@@ -117,6 +146,7 @@ impl StreamPool {
             max_connections,
             slots: Vec::new(),
             frames,
+            frame_bytes: Arc::new(AtomicUsize::new(0)),
             clock,
             control_key: [Ustr::from(CONTROL_KEY)],
             next_request_id: 0,
@@ -129,22 +159,27 @@ impl StreamPool {
         max_streams.saturating_mul(max_connections)
     }
 
-    /// The reconnect counter of the connection carrying `stream`. It moves
-    /// when the socket reconnects, before the consumer has seen the
-    /// reconnect, so work started earlier can be recognised as out of date.
-    /// A stream no connection carries gets a counter that never moves.
-    pub(crate) fn reconnects_of(&self, stream: &str) -> Arc<AtomicU64> {
+    /// Snapshots belong to the last socket generation processed by the session.
+    pub(crate) fn reconnect_fence(&self, stream: &str) -> Option<ReconnectFence> {
         self.slots
             .iter()
             .find(|slot| slot.streams.iter().any(|open| open == stream))
-            .map_or_else(
-                || Arc::new(AtomicU64::new(0)),
-                |slot| Arc::clone(&slot.reconnects),
-            )
+            .map(|slot| slot.reconnects.fence())
     }
 
     pub(crate) fn connections(&self) -> usize {
         self.slots.len()
+    }
+
+    pub(crate) fn queued_frame_bytes(&self, count: usize) -> usize {
+        self.frame_bytes
+            .load(Ordering::Relaxed)
+            .saturating_add(count.saturating_mul(size_of::<PoolFrame>()))
+    }
+
+    pub(crate) fn frame_received(&self, message: &Message) {
+        self.frame_bytes
+            .fetch_sub(message.as_bytes().len(), Ordering::Relaxed);
     }
 
     fn free(&self) -> usize {
@@ -162,15 +197,21 @@ impl StreamPool {
     pub(crate) async fn open_connection(&mut self) -> anyhow::Result<()> {
         let index = self.slots.len();
         let frames = self.frames.clone();
+        let frame_bytes = Arc::clone(&self.frame_bytes);
         let clock = self.clock;
-        let reconnects = Arc::new(AtomicU64::new(0));
-        let counter = Arc::clone(&reconnects);
+        let reconnects = ReconnectEpoch::default();
+        let counter = Arc::clone(&reconnects.received);
         let handler: MessageHandler = Arc::new(move |message: Message| {
             if matches!(&message, Message::Text(text) if text.as_ref() == RECONNECTED.as_bytes()) {
                 counter.fetch_add(1, Ordering::AcqRel);
             }
+            let received_at = clock.get_time_ns();
+            let bytes = message.as_bytes().len();
+            frame_bytes.fetch_add(bytes, Ordering::Relaxed);
             // The receiver only closes when the session has ended.
-            let _ = frames.send((index, clock.get_time_ns(), message));
+            if frames.send((index, received_at, message)).is_err() {
+                frame_bytes.fetch_sub(bytes, Ordering::Relaxed);
+            }
         });
         let config = WebSocketConfig {
             url: self.url.clone(),
@@ -323,8 +364,11 @@ impl StreamPool {
         self.pending.retain(|_, (owner, _)| *owner != slot);
         let streams = self
             .slots
-            .get(slot)
-            .map(|slot| slot.streams.clone())
+            .get_mut(slot)
+            .map(|slot| {
+                slot.reconnects.consumed = slot.reconnects.consumed.wrapping_add(1);
+                slot.streams.clone()
+            })
             .unwrap_or_default();
         let sent = self.send(slot, "SUBSCRIBE", &streams).await;
         let unsent = streams.get(sent..).unwrap_or_default().to_vec();
@@ -368,6 +412,21 @@ impl StreamPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_fences_use_the_session_generation_while_reconnects_are_queued() {
+        let mut epoch = ReconnectEpoch::default();
+        let queued = epoch.fence();
+        assert!(queued.is_current());
+        epoch.received.store(2, Ordering::Release);
+        assert!(!queued.is_current());
+        assert!(!epoch.fence().is_current());
+        epoch.consumed = 1;
+        assert!(!epoch.fence().is_current());
+        epoch.consumed = 2;
+        assert!(epoch.fence().is_current());
+        assert!(!queued.is_current());
+    }
 
     #[test]
     fn control_messages_stay_under_the_venue_limit() {

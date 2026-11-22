@@ -4,13 +4,7 @@
 //! [`AsterFeed`], and the set of subscriptions. The client methods only send
 //! it commands.
 
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-    time::Duration,
-};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use ahash::AHashMap;
 use anyhow::Context;
@@ -59,7 +53,10 @@ use crate::{
     },
     instruments::diff_instruments,
     subscriptions::{Command, Kind, Subscriptions},
-    websocket::pool::{PoolFrame, StreamPool},
+    websocket::{
+        messages::Envelope,
+        pool::{PoolFrame, ReconnectFence, StreamPool},
+    },
 };
 
 /// How often streams that could not be opened are tried again.
@@ -82,11 +79,16 @@ struct SnapshotResult {
     symbol: Ustr,
     /// The symbol's snapshot epoch when the request was made.
     epoch: u64,
-    /// The reconnect counter of the book's connection, and its value when
-    /// the request was made.
-    fence: Arc<AtomicU64>,
-    seen: u64,
+    fence: Option<ReconnectFence>,
     body: anyhow::Result<String>,
+}
+
+enum SnapshotJob {
+    Queued {
+        ready: Instant,
+        fence: Option<ReconnectFence>,
+    },
+    InFlight(JoinHandle<()>),
 }
 
 /// The background task that owns the socket and the feed.
@@ -103,6 +105,8 @@ struct Session {
     /// Bumped whenever a book is reset, so a response to a request made
     /// before the reset can be told apart and discarded.
     snapshot_epochs: AHashMap<Ustr, u64>,
+    snapshot_jobs: AHashMap<Ustr, SnapshotJob>,
+    pending_snapshots: BTreeSet<(Instant, Ustr)>,
     snapshots_tx: UnboundedSender<SnapshotResult>,
     cancel: CancellationToken,
     events: Vec<FeedEvent>,
@@ -169,6 +173,13 @@ impl Session {
     fn reset_book(&mut self, symbol: Ustr) {
         self.feed.reset_book(symbol.as_str());
         self.bump_snapshot_epoch(symbol);
+        match self.snapshot_jobs.remove(&symbol) {
+            Some(SnapshotJob::Queued { ready, .. }) => {
+                self.pending_snapshots.remove(&(ready, symbol));
+            }
+            Some(SnapshotJob::InFlight(task)) => task.abort(),
+            None => {}
+        }
     }
 
     /// Applies a batch of commands with at most one message per direction.
@@ -192,34 +203,47 @@ impl Session {
         self.pool.unsubscribe(&changes.closed).await;
     }
 
-    fn fetch_snapshot(&mut self, symbol: Ustr, delay: Duration) {
+    fn queue_snapshot(&mut self, symbol: Ustr, delay: Duration) {
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.snapshot_jobs.entry(symbol) {
+            let now = Instant::now();
+            let ready = now.checked_add(delay).unwrap_or(now);
+            let fence = self
+                .feed
+                .instrument_id(symbol.as_str())
+                .and_then(|id| self.pool.reconnect_fence(&Kind::Book.stream(&id)));
+            self.pending_snapshots.insert((ready, symbol));
+            entry.insert(SnapshotJob::Queued { ready, fence });
+        }
+    }
+
+    fn snapshot_deadline(&self) -> Option<Instant> {
+        self.pending_snapshots
+            .first()
+            .map(|(ready, _)| (*ready).max(self.next_snapshot_at))
+    }
+
+    fn start_snapshot(&mut self) {
+        let Some((_, symbol)) = self.pending_snapshots.pop_first() else {
+            return;
+        };
+        let Some(SnapshotJob::Queued { fence, .. }) = self.snapshot_jobs.remove(&symbol) else {
+            return;
+        };
+        if fence.as_ref().is_some_and(|fence| !fence.is_current()) {
+            return;
+        }
         let epoch = *self.snapshot_epochs.entry(symbol).or_insert(0);
-        let stream = self
-            .feed
-            .instrument_id(symbol.as_str())
-            .map(|id| Kind::Book.stream(&id))
-            .unwrap_or_default();
-        let fence = self.pool.reconnects_of(&stream);
-        let seen = fence.load(Ordering::Acquire);
         let http = self.http.clone();
         let results = self.snapshots_tx.clone();
         let depth = self.config.book_snapshot_depth;
         let cancel = self.cancel.clone();
-        // Requests are spaced out: subscribing to many books at once would
-        // otherwise spend the venue's whole request allowance.
+        // Spend a rate-limit slot only when a request is actually started.
         let now = Instant::now();
-        let at = now
-            .checked_add(delay)
-            .unwrap_or(now)
-            .max(self.next_snapshot_at);
-        self.next_snapshot_at = at.checked_add(self.snapshot_spacing).unwrap_or(at);
-        get_runtime().spawn(async move {
+        self.next_snapshot_at = now.checked_add(self.snapshot_spacing).unwrap_or(now);
+        let task = get_runtime().spawn(async move {
             let request = async {
-                tokio::time::sleep_until(at).await;
-                // A request overtaken by a reconnect while it waited its
-                // turn is not worth its request weight.
                 anyhow::ensure!(
-                    fence.load(Ordering::Acquire) == seen,
+                    fence.as_ref().is_none_or(ReconnectFence::is_current),
                     "superseded by a reconnect"
                 );
                 http.request_depth(symbol.as_str(), depth).await
@@ -229,21 +253,21 @@ impl Session {
                 () = cancel.cancelled() => {}
                 body = request => {
                     // The receiver only closes when the session has ended.
-                    let _ = results.send(SnapshotResult { symbol, epoch, fence, seen, body });
+                    let _ = results.send(SnapshotResult { symbol, epoch, fence, body });
                 }
             }
         });
+        self.snapshot_jobs
+            .insert(symbol, SnapshotJob::InFlight(task));
     }
 
     fn publish(&mut self) {
-        for event in std::mem::take(&mut self.events) {
+        let mut events = std::mem::take(&mut self.events);
+        for event in events.drain(..) {
             match event {
                 FeedEvent::SnapshotRequired(symbol) => {
                     if self.book_wanted(symbol) {
-                        // A new need for a snapshot supersedes any request
-                        // still in flight for the book.
-                        self.bump_snapshot_epoch(symbol);
-                        self.fetch_snapshot(symbol, Duration::ZERO);
+                        self.queue_snapshot(symbol, Duration::ZERO);
                     } else {
                         // A depth frame that was already queued when the book
                         // was unsubscribed. Forget it, so a later subscription
@@ -269,6 +293,7 @@ impl Session {
                 }
             }
         }
+        self.events = events;
     }
 
     async fn on_frame(&mut self, slot: usize, ts_init: UnixNanos, text: &str) {
@@ -292,7 +317,14 @@ impl Session {
         if self.config.debug_frames {
             log::debug!("Aster frame: {text}");
         }
-        if !text.contains("\"stream\"") {
+        let envelope = match Envelope::parse(text) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                log::warn!("Aster dropped a frame: {error:#}");
+                return;
+            }
+        };
+        if envelope.stream.is_none() && envelope.data.is_none() {
             // A control reply. Streams the venue refused are tried again.
             let refused = self.pool.on_reply(slot, text);
             self.unplaced.extend(refused);
@@ -301,7 +333,10 @@ impl Session {
                 .retain(|stream| self.subscriptions.uses(stream));
             return;
         }
-        if let Err(error) = self.feed.handle_text(text, ts_init, &mut self.events) {
+        if let Err(error) = self
+            .feed
+            .handle_envelope(&envelope, ts_init, &mut self.events)
+        {
             log::warn!("Aster dropped a frame: {error:#}");
         }
         self.publish();
@@ -312,7 +347,6 @@ impl Session {
             symbol,
             epoch,
             fence,
-            seen,
             body,
         } = result;
         if self.snapshot_epochs.get(&symbol) != Some(&epoch) {
@@ -320,15 +354,12 @@ impl Session {
             // book from before a reconnect or an earlier subscription.
             return;
         }
-        if fence.load(Ordering::Acquire) != seen {
+        self.snapshot_jobs.remove(&symbol);
+        if fence.as_ref().is_some_and(|fence| !fence.is_current()) {
             // The book's connection has reconnected since the request, and
             // its reconnect may still be queued behind this result, so the
-            // snapshot predates the gap. Ask again. The reset that follows
-            // the reconnect discards the new request too, and the book's
-            // next update starts a fresh one.
-            if self.book_wanted(symbol) {
-                self.fetch_snapshot(symbol, Duration::ZERO);
-            }
+            // snapshot predates the gap. The reconnect resets the book and
+            // its next update schedules recovery.
             return;
         }
         if !self.book_wanted(symbol) {
@@ -336,18 +367,26 @@ impl Session {
             return;
         }
         let ts_init = self.clock.get_time_ns();
+        let previous_events = self.events.len();
         let applied = body.and_then(|body| {
             self.feed
                 .handle_depth_snapshot(symbol.as_str(), &body, ts_init, &mut self.events)
         });
+        if fence.as_ref().is_some_and(|fence| !fence.is_current()) {
+            // Decoding a large snapshot and its buffered suffix takes time.
+            self.events.truncate(previous_events);
+            self.reset_book(symbol);
+            return;
+        }
         if let Err(error) = applied {
             log::warn!("Aster book snapshot for {symbol} failed, retrying: {error:#}");
-            self.fetch_snapshot(symbol, SNAPSHOT_RETRY_DELAY);
+            self.queue_snapshot(symbol, SNAPSHOT_RETRY_DELAY);
         }
         self.publish();
     }
 
     async fn on_message(&mut self, (slot, ts_init, message): PoolFrame) {
+        self.pool.frame_received(&message);
         if let Message::Text(text) = message {
             match std::str::from_utf8(&text) {
                 Ok(text) => self.on_frame(slot, ts_init, text).await,
@@ -392,17 +431,48 @@ impl Session {
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut health = tokio::time::interval(BOOK_HEALTH_INTERVAL);
         health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let snapshot_timer = tokio::time::sleep(Duration::ZERO);
+        tokio::pin!(snapshot_timer);
+        let mut armed_snapshot = None;
+        let mut oldest_frame: Option<PoolFrame> = None;
         loop {
+            let snapshot_deadline = self.snapshot_deadline();
+            if snapshot_deadline != armed_snapshot {
+                if let Some(deadline) = snapshot_deadline {
+                    snapshot_timer.as_mut().reset(deadline);
+                }
+                armed_snapshot = snapshot_deadline;
+            }
             tokio::select! {
                 biased;
                 () = self.cancel.cancelled() => {
                     // Publish what had already arrived before stopping.
-                    while let Ok(frame) = frames.try_recv() {
+                    frames.close();
+                    if let Some(frame) = oldest_frame.take() {
+                        self.on_message(frame).await;
+                    }
+                    while let Some(frame) = frames.recv().await {
                         self.on_message(frame).await;
                     }
                     break;
                 }
-                _ = health.tick() => self.report_unsynced_books(),
+                _ = health.tick() => {
+                    self.report_unsynced_books();
+                    // Keep the queue head in order while sampling its receive timestamp.
+                    if oldest_frame.is_none() {
+                        oldest_frame = frames.try_recv().ok();
+                    }
+                    let count = frames.len().saturating_add(usize::from(oldest_frame.is_some()));
+                    let bytes = self.pool.queued_frame_bytes(count);
+                    let age_ms = oldest_frame.as_ref().map_or(0, |(_, ts, _)| {
+                        self.clock.get_time_ns().as_u64().saturating_sub(ts.as_u64()) / 1_000_000
+                    });
+                    log::info!(
+                        "Aster ingress backlog frames={count} bytes_estimate={bytes} oldest_ms={age_ms} \
+                         pending_book_bytes={} snapshot_jobs={}",
+                        self.feed.buffered_depth_bytes(), self.snapshot_jobs.len()
+                    );
+                }
                 _ = retry.tick(), if !self.unplaced.is_empty() => {
                     let streams = std::mem::take(&mut self.unplaced);
                     self.open(&streams).await;
@@ -426,7 +496,10 @@ impl Session {
                         self.feed.replace_funding_intervals(intervals);
                     }
                 }
-                frame = frames.recv() => match frame {
+                () = &mut snapshot_timer, if armed_snapshot.is_some() => self.start_snapshot(),
+                frame = async {
+                    if let Some(frame) = oldest_frame.take() { Some(frame) } else { frames.recv().await }
+                } => match frame {
                     Some(frame) => self.on_message(frame).await,
                     None => break,
                 },
@@ -561,6 +634,53 @@ impl Refresher {
     }
 }
 
+/// Owns the tasks and command channel for one live session.
+#[derive(Debug)]
+struct RunningSession {
+    commands: UnboundedSender<Command>,
+    cancel: CancellationToken,
+    task: JoinHandle<()>,
+    refresher: Option<JoinHandle<()>>,
+}
+
+impl RunningSession {
+    fn is_running(&self) -> bool {
+        !self.cancel.is_cancelled() && !self.task.is_finished()
+    }
+
+    fn stop(&self) {
+        self.cancel.cancel();
+        if let Some(refresher) = &self.refresher {
+            refresher.abort();
+        }
+    }
+
+    async fn shutdown(&mut self) {
+        self.stop();
+        // Join the refresher before a new session can write to the shared cache.
+        if let Some(refresher) = &mut self.refresher {
+            let _ = refresher.await;
+            self.refresher = None;
+        }
+        match tokio::time::timeout(DISCONNECT_TIMEOUT, &mut self.task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => log::warn!("Aster session ended: {error}"),
+            Err(_) => {
+                log::warn!("Aster session did not stop within {DISCONNECT_TIMEOUT:?}; aborting it");
+                self.task.abort();
+                let _ = (&mut self.task).await;
+            }
+        }
+    }
+}
+
+impl Drop for RunningSession {
+    fn drop(&mut self) {
+        self.stop();
+        self.task.abort();
+    }
+}
+
 /// Market-data client for Aster perpetual futures.
 #[derive(Debug)]
 pub struct AsterDataClient {
@@ -570,11 +690,7 @@ pub struct AsterDataClient {
     clock: &'static AtomicTime,
     sender: EventSender<DataEvent>,
     instruments: Arc<AtomicMap<InstrumentId, InstrumentAny>>,
-    connected: AtomicBool,
-    commands: Option<UnboundedSender<Command>>,
-    cancel: CancellationToken,
-    session: Option<JoinHandle<()>>,
-    refresher: Option<JoinHandle<()>>,
+    session: Option<RunningSession>,
 }
 
 impl AsterDataClient {
@@ -592,11 +708,7 @@ impl AsterDataClient {
             clock: get_atomic_clock_realtime(),
             sender: get_data_event_sender(),
             instruments: Arc::new(AtomicMap::new()),
-            connected: AtomicBool::new(false),
-            commands: None,
-            cancel: CancellationToken::new(),
             session: None,
-            refresher: None,
         })
     }
 
@@ -615,9 +727,11 @@ impl AsterDataClient {
     }
 
     fn send(&self, command: Command) -> anyhow::Result<()> {
-        self.commands
+        self.session
             .as_ref()
+            .filter(|session| !session.cancel.is_cancelled())
             .context("Aster data client is not connected")?
+            .commands
             .send(command)
             .map_err(|_| anyhow::anyhow!("Aster session has stopped"))
     }
@@ -643,14 +757,17 @@ impl AsterDataClient {
         }
     }
 
-    fn halt(&mut self) {
-        // A refresh still in flight must not write into a later session.
-        if let Some(refresher) = self.refresher.take() {
-            refresher.abort();
+    fn halt(&self) {
+        if let Some(session) = &self.session {
+            session.stop();
         }
-        self.cancel.cancel();
-        self.commands = None;
-        self.connected.store(false, Ordering::Release);
+    }
+
+    async fn shutdown_session(&mut self) {
+        if let Some(session) = &mut self.session {
+            session.shutdown().await;
+            self.session = None;
+        }
     }
 }
 
@@ -686,13 +803,9 @@ impl DataClient for AsterDataClient {
     }
 
     fn is_connected(&self) -> bool {
-        // A session that ended on its own (a panic, a closed channel) is not
-        // connected, whatever the flag says.
-        self.connected.load(Ordering::Acquire)
-            && self
-                .session
-                .as_ref()
-                .is_some_and(|session| !session.is_finished())
+        self.session
+            .as_ref()
+            .is_some_and(RunningSession::is_running)
     }
 
     fn is_disconnected(&self) -> bool {
@@ -703,6 +816,7 @@ impl DataClient for AsterDataClient {
         if self.is_connected() {
             return Ok(());
         }
+        self.shutdown_session().await;
 
         let parsed = self
             .http
@@ -718,7 +832,10 @@ impl DataClient for AsterDataClient {
             parsed.skipped.len(),
             parsed.failed.len()
         );
-        let mut feed = AsterFeed::new(&parsed.instruments);
+        let mut feed = AsterFeed::new(&parsed.instruments).with_book_buffer_limits(
+            self.config.book_buffer_bytes,
+            self.config.session_book_buffer_bytes,
+        );
         match self.http.request_funding_intervals().await {
             Ok(intervals) => feed.set_funding_intervals(&intervals),
             Err(error) => log::warn!("Aster funding intervals unavailable: {error:#}"),
@@ -743,7 +860,7 @@ impl DataClient for AsterDataClient {
         let (commands_tx, commands_rx) = unbounded_channel();
         let (snapshots_tx, snapshots_rx) = unbounded_channel();
         let (updates_tx, updates_rx) = unbounded_channel();
-        self.cancel = CancellationToken::new();
+        let cancel = CancellationToken::new();
         let session = Session {
             feed,
             pool,
@@ -757,16 +874,17 @@ impl DataClient for AsterDataClient {
                 self.config.max_connections,
             )),
             snapshot_epochs: AHashMap::new(),
+            snapshot_jobs: AHashMap::new(),
+            pending_snapshots: BTreeSet::new(),
             snapshots_tx,
-            cancel: self.cancel.clone(),
+            cancel: cancel.clone(),
             events: Vec::new(),
             next_snapshot_at: Instant::now(),
             snapshot_spacing: snapshot_spacing(&self.config),
         };
-        self.session =
-            Some(get_runtime().spawn(session.run(frames, commands_rx, snapshots_rx, updates_rx)));
+        let task = get_runtime().spawn(session.run(frames, commands_rx, snapshots_rx, updates_rx));
         let refresh_every = Duration::from_secs(self.config.instrument_refresh_interval_secs);
-        if !refresh_every.is_zero() {
+        let refresher = (!refresh_every.is_zero()).then(|| {
             let refresher = Refresher {
                 http: self.http.clone(),
                 clock: self.clock,
@@ -774,25 +892,20 @@ impl DataClient for AsterDataClient {
                 instruments: Arc::clone(&self.instruments),
                 updates: updates_tx,
             };
-            self.refresher =
-                Some(get_runtime().spawn(refresher.run(refresh_every, self.cancel.clone())));
-        }
-        self.commands = Some(commands_tx);
-        self.connected.store(true, Ordering::Release);
+            get_runtime().spawn(refresher.run(refresh_every, cancel.clone()))
+        });
+        self.session = Some(RunningSession {
+            commands: commands_tx,
+            cancel,
+            task,
+            refresher,
+        });
         log::info!("Connected Aster data client {}", self.client_id);
         Ok(())
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
-        self.halt();
-        if let Some(mut session) = self.session.take()
-            && tokio::time::timeout(DISCONNECT_TIMEOUT, &mut session)
-                .await
-                .is_err()
-        {
-            log::warn!("Aster session did not stop within {DISCONNECT_TIMEOUT:?}; aborting it");
-            session.abort();
-        }
+        self.shutdown_session().await;
         log::info!("Disconnected Aster data client {}", self.client_id);
         Ok(())
     }

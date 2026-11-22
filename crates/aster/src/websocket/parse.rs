@@ -11,9 +11,10 @@ use nautilus_model::{
     },
     enums::{BookAction, OrderSide},
     identifiers::InstrumentId,
+    types::{Price, Quantity},
 };
 
-use super::messages::{AggTrade, BookTicker, DepthUpdate, MarkPrice, Trade};
+use super::messages::{AggTrade, BookTicker, DepthUpdate, InlineDepthUpdate, MarkPrice, Trade};
 use crate::common::{self, REFERENCE_PRICE_PRECISION, RawTrade};
 
 /// The identity and precisions needed to parse an instrument's messages.
@@ -40,34 +41,68 @@ pub fn parse_depth_update(
     spec: InstrumentSpec,
     ts_init: UnixNanos,
 ) -> anyhow::Result<Option<OrderBookDeltas>> {
+    build_depth_update(update, spec, ts_init)
+}
+
+pub(crate) fn parse_inline_depth_update(
+    update: &InlineDepthUpdate<'_>,
+    spec: InstrumentSpec,
+    ts_init: UnixNanos,
+) -> anyhow::Result<Option<OrderBookDeltas>> {
+    build_depth_update(update, spec, ts_init)
+}
+
+pub(crate) fn validate_inline_depth_update(
+    update: &InlineDepthUpdate<'_>,
+    spec: InstrumentSpec,
+) -> anyhow::Result<()> {
+    common::millis(update.transaction_time)?;
+    visit_levels(update, spec, |_, _, _| {})
+}
+
+fn visit_levels<'a>(
+    update: &DepthUpdate<'a, impl AsRef<[[&'a str; 2]]>>,
+    spec: InstrumentSpec,
+    mut visit: impl FnMut(OrderSide, Price, Quantity),
+) -> anyhow::Result<()> {
+    for (side, levels) in [
+        (OrderSide::Buy, update.bids.as_ref()),
+        (OrderSide::Sell, update.asks.as_ref()),
+    ] {
+        for [price, size] in levels {
+            let quantity = common::exact_quantity(size, spec.size_precision)?;
+            let price = common::exact_price(price, spec.price_precision)?;
+            visit(side, price, quantity);
+        }
+    }
+    Ok(())
+}
+
+fn build_depth_update<'a>(
+    update: &DepthUpdate<'a, impl AsRef<[[&'a str; 2]]>>,
+    spec: InstrumentSpec,
+    ts_init: UnixNanos,
+) -> anyhow::Result<Option<OrderBookDeltas>> {
     let ts_event = common::millis(update.transaction_time)?;
     let sequence = update.final_update_id;
 
-    let level_count = update.bids.len().saturating_add(update.asks.len());
+    let level_count = update
+        .bids
+        .as_ref()
+        .len()
+        .saturating_add(update.asks.as_ref().len());
     let mut deltas = Vec::with_capacity(level_count);
-    let sides = [
-        (OrderSide::Buy, &update.bids),
-        (OrderSide::Sell, &update.asks),
-    ];
-    for (side, levels) in sides {
-        for [price, size] in levels {
-            let size = common::exact_quantity(size, spec.size_precision)?;
-            let action = if size.is_zero() {
-                BookAction::Delete
-            } else {
-                BookAction::Update
-            };
-            let order = BookOrder::new(
-                side,
-                common::exact_price(price, spec.price_precision)?,
-                size,
-                0,
-            );
-            deltas.push(OrderBookDelta::new(
-                spec.id, action, order, 0, sequence, ts_event, ts_init,
-            ));
-        }
-    }
+    visit_levels(update, spec, |side, price, size| {
+        let action = if size.is_zero() {
+            BookAction::Delete
+        } else {
+            BookAction::Update
+        };
+        let order = BookOrder::new(side, price, size, 0);
+        deltas.push(OrderBookDelta::new(
+            spec.id, action, order, 0, sequence, ts_event, ts_init,
+        ));
+    })?;
     let Some(last) = deltas.last_mut() else {
         return Ok(None);
     };

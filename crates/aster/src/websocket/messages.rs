@@ -1,7 +1,9 @@
 //! Market-stream payloads. Field names follow the venue's one-letter keys.
 
+use anyhow::Context;
 use serde::Deserialize;
 use serde_json::value::RawValue;
+use smallvec::SmallVec;
 
 /// Combined-stream wrapper: `{"stream": "btcusdt@aggTrade", "data": {...}}`.
 ///
@@ -13,9 +15,15 @@ pub struct Envelope<'a> {
     pub data: Option<&'a RawValue>,
 }
 
+impl<'a> Envelope<'a> {
+    pub(crate) fn parse(text: &'a str) -> anyhow::Result<Self> {
+        serde_json::from_str(text).context("invalid WebSocket frame")
+    }
+}
+
 /// `<symbol>@depth`: a diff of absolute level quantities.
 #[derive(Debug, Deserialize)]
-pub struct DepthUpdate<'a> {
+pub struct DepthUpdate<'a, Levels = Vec<[&'a str; 2]>> {
     #[serde(rename = "T")]
     pub transaction_time: u64,
     #[serde(rename = "s")]
@@ -26,11 +34,13 @@ pub struct DepthUpdate<'a> {
     pub final_update_id: u64,
     #[serde(rename = "pu")]
     pub prev_final_update_id: u64,
-    #[serde(rename = "b", borrow)]
-    pub bids: Vec<[&'a str; 2]>,
-    #[serde(rename = "a", borrow)]
-    pub asks: Vec<[&'a str; 2]>,
+    #[serde(rename = "b")]
+    pub bids: Levels,
+    #[serde(rename = "a")]
+    pub asks: Levels,
 }
+
+pub(crate) type InlineDepthUpdate<'a> = DepthUpdate<'a, SmallVec<[[&'a str; 2]; 8]>>;
 
 /// `<symbol>@aggTrade`: fills of one taker order at one price.
 #[derive(Debug, Deserialize)]

@@ -1,53 +1,119 @@
 //! Depth sequence tracking for one instrument.
 //!
-//! Aster's update ids are venue-global: a symbol's consecutive diffs are
-//! not numerically adjacent. Continuity is established only by each diff's
-//! `pu` equalling the previous diff's `u`.
+//! Aster's update ids are venue-global: continuity is established by each
+//! diff's pu equalling its predecessor's u.
+
+use std::collections::VecDeque;
 
 use nautilus_model::data::OrderBookDeltas;
 
-/// A parsed depth diff with the ids needed to sequence it.
+/// A depth diff with the IDs needed to sequence it.
 #[derive(Debug)]
-pub struct DepthDiff {
-    /// `u`: the last update id covered by this diff.
+pub struct DepthDiff<T = OrderBookDeltas> {
+    /// The last update ID covered by this diff.
     pub final_update_id: u64,
-    /// `pu`: the `u` of the previous diff for this symbol.
+    /// The last update ID covered by its predecessor.
     pub prev_final_update_id: u64,
-    /// `None` when the diff changes no level.
-    pub deltas: Option<OrderBookDeltas>,
+    /// The payload, or none when the diff has no level changes.
+    pub deltas: Option<T>,
 }
 
-/// What the caller must do after handing a diff or snapshot to [`BookSync`].
-#[derive(Debug, PartialEq, Eq)]
+/// What the caller must do after handing the book an update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
-    /// Nothing to emit.
+    /// No snapshot request is needed.
     None,
-    /// A depth snapshot must be fetched and passed to [`BookSync::on_snapshot`].
+    /// Fetch another REST snapshot.
     RequestSnapshot,
 }
 
-/// Diffs buffered while waiting for a snapshot before the wait is given up
-/// and started again. Snapshots are paced, so with every book of the venue
-/// subscribed at once the last one waits about seven minutes, which is some
-/// 4,000 diffs at ten a second.
+/// Also cap the number of diffs, including empty sequence updates.
 const MAX_BUFFERED: usize = 20_000;
 
 #[derive(Debug)]
-enum State {
-    /// Waiting for a snapshot; diffs are held until it arrives.
-    Buffering {
-        diffs: Vec<DepthDiff>,
-        requested: bool,
-    },
-    /// Applying diffs. `linked` is false until the first diff after the
-    /// snapshot has been accepted.
+struct Pending<T> {
+    diffs: VecDeque<(DepthDiff<T>, usize)>,
+    bytes: usize,
+    evicted_through: Option<u64>,
+}
+
+impl<T> Pending<T> {
+    const SLOT_BYTES: usize = size_of::<(DepthDiff<T>, usize)>();
+
+    const fn new() -> Self {
+        Self {
+            diffs: VecDeque::new(),
+            bytes: 0,
+            evicted_through: None,
+        }
+    }
+
+    fn pop_front(&mut self) -> Option<(DepthDiff<T>, usize)> {
+        let (diff, bytes) = self.diffs.pop_front()?;
+        self.bytes = self.bytes.saturating_sub(bytes);
+        Some((diff, bytes))
+    }
+
+    fn evict(&mut self, final_update_id: u64) {
+        self.evicted_through = Some(
+            self.evicted_through
+                .map_or(final_update_id, |previous| previous.max(final_update_id)),
+        );
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.bytes
+            .saturating_add(self.diffs.capacity().saturating_mul(Self::SLOT_BYTES))
+    }
+
+    fn trim_storage(&mut self) {
+        if self.diffs.len() <= self.diffs.capacity() / 4 {
+            self.diffs.shrink_to_fit();
+        }
+    }
+
+    fn push(&mut self, diff: DepthDiff<T>, bytes: usize, budget: usize) {
+        let can_fit = bytes.saturating_add(Self::SLOT_BYTES) <= budget;
+        while self.diffs.len() >= MAX_BUFFERED
+            || !can_fit
+            || self.bytes.saturating_add(bytes).saturating_add(
+                self.diffs
+                    .len()
+                    .saturating_add(1)
+                    .saturating_mul(Self::SLOT_BYTES),
+            ) > budget
+        {
+            let Some((old, _)) = self.pop_front() else {
+                break;
+            };
+            self.evict(old.final_update_id);
+        }
+        if !can_fit {
+            // Require the snapshot to cover this update even if the
+            // retained suffix is empty.
+            self.diffs = VecDeque::new();
+            self.evict(diff.final_update_id);
+            return;
+        }
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.diffs.push_back((diff, bytes));
+        if self.retained_bytes() > budget {
+            self.diffs.shrink_to_fit();
+        }
+    }
+}
+
+#[derive(Debug)]
+enum State<T> {
+    Idle,
+    Buffering(Pending<T>),
     Live { last_update_id: u64, linked: bool },
 }
 
 /// Orders depth diffs around REST snapshots and detects gaps.
 #[derive(Debug)]
-pub struct BookSync {
-    state: State,
+pub struct BookSync<T = OrderBookDeltas> {
+    state: State<T>,
 }
 
 impl Default for BookSync {
@@ -56,6 +122,7 @@ impl Default for BookSync {
     }
 }
 
+#[derive(PartialEq, Eq)]
 enum Verdict {
     Stale,
     Apply,
@@ -64,40 +131,55 @@ enum Verdict {
 
 impl BookSync {
     #[must_use]
-    pub fn new() -> Self {
-        Self {
-            state: State::Buffering {
-                diffs: Vec::new(),
-                requested: false,
-            },
-        }
+    pub const fn new() -> Self {
+        Self::empty()
+    }
+}
+
+impl<T> BookSync<T> {
+    pub(crate) const fn empty() -> Self {
+        Self { state: State::Idle }
     }
 
-    /// Returns `true` while diffs are being held for a requested snapshot.
+    /// Returns true while a book has work pending from a snapshot request.
     #[must_use]
     pub fn is_awaiting_snapshot(&self) -> bool {
-        matches!(
-            self.state,
-            State::Buffering {
-                requested: true,
-                ..
-            }
-        )
+        matches!(self.state, State::Buffering(_))
     }
 
-    /// Returns `true` once a snapshot has been applied and no gap is pending.
+    /// Returns true once a snapshot has been applied and no gap is pending.
     #[must_use]
     pub fn is_live(&self) -> bool {
         matches!(self.state, State::Live { .. })
     }
 
-    /// Drops all progress, as after a reconnect. The next diff requests a
-    /// new snapshot.
+    /// Drops all progress. The next diff requests a new snapshot.
     pub fn reset(&mut self) {
-        *self = Self::new();
+        *self = Self::empty();
     }
 
-    fn judge(last_update_id: u64, linked: bool, diff: &DepthDiff) -> Verdict {
+    pub(crate) fn buffered_bytes(&self) -> usize {
+        match &self.state {
+            State::Buffering(pending) => pending.retained_bytes(),
+            _ => 0,
+        }
+    }
+
+    pub(crate) fn buffers(&self, diff: &DepthDiff<T>) -> bool {
+        match self.state {
+            State::Live {
+                last_update_id,
+                linked,
+            } => Self::judge(last_update_id, linked, diff) == Verdict::Gap,
+            _ => true,
+        }
+    }
+
+    pub(crate) fn payload_fits(bytes: usize, budget: usize) -> bool {
+        bytes.saturating_add(Pending::<T>::SLOT_BYTES) <= budget
+    }
+
+    fn judge(last_update_id: u64, linked: bool, diff: &DepthDiff<T>) -> Verdict {
         if linked {
             if diff.prev_final_update_id == last_update_id {
                 Verdict::Apply
@@ -105,109 +187,105 @@ impl BookSync {
                 Verdict::Gap
             }
         } else if diff.final_update_id <= last_update_id {
-            // Everything in it is already in the snapshot.
             Verdict::Stale
         } else if diff.prev_final_update_id <= last_update_id {
-            // The snapshot lies inside this diff, or between it and the
-            // previous one. Quantities are absolute, so applying it whole
-            // is correct either way.
+            // Quantities are absolute, so a diff overlapping the snapshot
+            // can be applied whole.
             Verdict::Apply
         } else {
             Verdict::Gap
         }
     }
 
-    /// Starts over, keeping `diffs` to replay after the next snapshot.
-    fn restart(&mut self, diffs: Vec<DepthDiff>) -> Action {
-        self.state = State::Buffering {
-            diffs,
-            requested: true,
-        };
-        Action::RequestSnapshot
+    /// Handles a diff from the stream, pushing deltas to emit onto the output.
+    pub fn on_diff(&mut self, diff: DepthDiff<T>, out: &mut Vec<T>) -> Action {
+        self.on_diff_with_budget(diff, 0, usize::MAX, out)
     }
 
-    /// Handles a diff from the stream, pushing deltas to emit onto `out`.
-    pub fn on_diff(&mut self, diff: DepthDiff, out: &mut Vec<OrderBookDeltas>) -> Action {
+    pub(crate) fn on_diff_with_budget(
+        &mut self,
+        diff: DepthDiff<T>,
+        bytes: usize,
+        budget: usize,
+        out: &mut Vec<T>,
+    ) -> Action {
         match &mut self.state {
-            State::Buffering { diffs, requested } => {
-                if diffs.len() >= MAX_BUFFERED {
-                    // The snapshot never arrived; start over from this diff.
-                    return self.restart(vec![diff]);
-                }
-                diffs.push(diff);
-                if *requested {
-                    Action::None
-                } else {
-                    *requested = true;
-                    Action::RequestSnapshot
-                }
+            State::Buffering(pending) => {
+                pending.push(diff, bytes, budget);
+                return Action::None;
             }
             State::Live {
                 last_update_id,
                 linked,
             } => match Self::judge(*last_update_id, *linked, &diff) {
-                Verdict::Stale => Action::None,
+                Verdict::Stale => return Action::None,
                 Verdict::Apply => {
                     *last_update_id = diff.final_update_id;
                     *linked = true;
                     out.extend(diff.deltas);
-                    Action::None
+                    return Action::None;
                 }
-                // Keep the diff that exposed the gap: it follows the new snapshot
-                // unless that snapshot already includes it.
-                Verdict::Gap => self.restart(vec![diff]),
+                Verdict::Gap => {}
             },
+            State::Idle => {}
         }
+
+        let mut pending = Pending::new();
+        pending.push(diff, bytes, budget);
+        self.state = State::Buffering(pending);
+        Action::RequestSnapshot
     }
 
-    /// Handles a REST snapshot, pushing the snapshot and any buffered diffs
-    /// that follow it onto `out`.
-    ///
-    /// A snapshot older than the buffered diffs is discarded and a new one
-    /// requested. A snapshot that was not asked for is ignored: one arriving
-    /// while live, or after a [`reset`](Self::reset) and before the next diff.
-    pub fn on_snapshot(
-        &mut self,
-        last_update_id: u64,
-        snapshot: OrderBookDeltas,
-        out: &mut Vec<OrderBookDeltas>,
-    ) -> Action {
-        let State::Buffering {
-            diffs,
-            requested: true,
-        } = &mut self.state
-        else {
+    /// Handles a REST snapshot, pushing it and the contiguous diffs following
+    /// it onto the output. A snapshot that predates the buffer is retried.
+    pub fn on_snapshot(&mut self, last_update_id: u64, snapshot: T, out: &mut Vec<T>) -> Action {
+        let State::Buffering(pending) = &mut self.state else {
             return Action::None;
         };
-        let buffered = std::mem::take(diffs);
-        let mut pending = buffered
-            .into_iter()
-            .skip_while(|diff| diff.final_update_id <= last_update_id)
-            .peekable();
-        if let Some(first) = pending.peek()
-            && first.prev_final_update_id > last_update_id
+        while pending
+            .diffs
+            .front()
+            .is_some_and(|(diff, _)| diff.final_update_id <= last_update_id)
         {
-            // The snapshot predates the buffer, which already lost the diffs
-            // needed to bridge it.
-            *diffs = pending.collect();
+            pending.pop_front();
+        }
+        if pending
+            .evicted_through
+            .is_some_and(|id| id > last_update_id)
+            || pending
+                .diffs
+                .front()
+                .is_some_and(|(diff, _)| diff.prev_final_update_id > last_update_id)
+        {
+            pending.trim_storage();
             return Action::RequestSnapshot;
         }
+        pending.evicted_through = None;
 
         out.push(snapshot);
-        self.state = State::Live {
-            last_update_id,
-            linked: false,
-        };
-        while let Some(diff) = pending.next() {
-            if self.on_diff(diff, out) == Action::RequestSnapshot {
-                // A gap inside the buffer. Keep what follows it too, so one
-                // more snapshot is enough to catch up.
-                if let State::Buffering { diffs, .. } = &mut self.state {
-                    diffs.extend(pending);
+        let mut sequence = last_update_id;
+        let mut linked = false;
+        while let Some((diff, bytes)) = pending.pop_front() {
+            match Self::judge(sequence, linked, &diff) {
+                Verdict::Apply => {
+                    sequence = diff.final_update_id;
+                    linked = true;
+                    out.extend(diff.deltas);
                 }
-                return Action::RequestSnapshot;
+                Verdict::Gap => {
+                    // Preserve the first unlinked diff and everything after it.
+                    pending.bytes = pending.bytes.saturating_add(bytes);
+                    pending.diffs.push_front((diff, bytes));
+                    pending.trim_storage();
+                    return Action::RequestSnapshot;
+                }
+                Verdict::Stale => {}
             }
         }
+        self.state = State::Live {
+            last_update_id: sequence,
+            linked,
+        };
         Action::None
     }
 }
@@ -252,6 +330,51 @@ mod tests {
         assert_eq!(book.on_diff(diff(5, 9), &mut out), Action::None);
         assert_eq!(sequences(&out), Vec::<u64>::new());
         assert!(!book.is_live());
+    }
+
+    #[test]
+    fn byte_budget_keeps_the_newest_suffix_without_reissuing_the_snapshot() {
+        let mut book = BookSync::new();
+        let mut out = Vec::new();
+        let budget = (Pending::<OrderBookDeltas>::SLOT_BYTES + 10) * 2;
+        for (previous, last, expected) in [
+            (1, 10, Action::RequestSnapshot),
+            (10, 20, Action::None),
+            (20, 30, Action::None),
+        ] {
+            assert_eq!(
+                book.on_diff_with_budget(diff(previous, last), 10, budget, &mut out),
+                expected
+            );
+            assert!(book.buffered_bytes() <= budget);
+        }
+        assert_eq!(
+            book.on_snapshot(9, deltas(9), &mut out),
+            Action::RequestSnapshot
+        );
+        assert_eq!(sequences(&out), Vec::<u64>::new());
+        assert_eq!(book.on_snapshot(10, deltas(10), &mut out), Action::None);
+        assert_eq!(sequences(&out), [10, 20, 30]);
+        assert_eq!(book.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn a_snapshot_must_cover_an_oversized_diff_even_with_an_empty_buffer() {
+        let mut book = BookSync::new();
+        let mut out = Vec::new();
+        assert_eq!(
+            book.on_diff_with_budget(diff(1, 10), 100, 1, &mut out),
+            Action::RequestSnapshot
+        );
+        assert_eq!(book.buffered_bytes(), 0);
+        assert_eq!(
+            book.on_snapshot(9, deltas(9), &mut out),
+            Action::RequestSnapshot
+        );
+        assert_eq!(sequences(&out), Vec::<u64>::new());
+        assert!(!book.is_live());
+        assert_eq!(book.on_snapshot(10, deltas(10), &mut out), Action::None);
+        assert_eq!(sequences(&out), [10]);
     }
 
     #[test]

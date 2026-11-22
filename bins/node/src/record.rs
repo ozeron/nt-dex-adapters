@@ -4,6 +4,7 @@
 
 use std::{
     collections::BTreeSet,
+    ffi::OsStr,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -17,7 +18,9 @@ use log::LevelFilter;
 use nautilus_common::{
     actor::{DataActor, DataActorConfig, DataActorCore},
     enums::Environment,
+    live::dispatch::DispatchMessage,
     logging::logger::LoggerConfig,
+    messages::DataEvent,
     nautilus_actor,
 };
 use nautilus_core::{DurationNanos, UnixNanos};
@@ -65,6 +68,8 @@ struct Counters {
     /// Sum and maximum of trade `ts_init - ts_event`, in microseconds.
     trade_lag_sum_us: AtomicU64,
     trade_lag_max_us: AtomicU64,
+    /// Maximum socket-to-actor age plus one. Zero means no mark was dispatched.
+    mark_dispatch_age_max_us: AtomicU64,
 }
 
 fn bump(counter: &AtomicU64, by: u64) {
@@ -72,6 +77,18 @@ fn bump(counter: &AtomicU64, by: u64) {
 }
 
 impl Counters {
+    fn report_dispatch_backlog(&self, queued: usize) {
+        let inline_bytes = queued.saturating_mul(size_of::<DispatchMessage<DataEvent>>());
+        let mark_dispatch_age_us = self
+            .mark_dispatch_age_max_us
+            .swap(0, Ordering::Relaxed)
+            .checked_sub(1);
+        log::info!(
+            "Nautilus data backlog events={queued} inline_bytes={inline_bytes} \
+             max_mark_dispatch_age_us={mark_dispatch_age_us:?}"
+        );
+    }
+
     fn report(&self, elapsed: Duration) -> String {
         let get = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         let trades = get(&self.trades);
@@ -154,8 +171,13 @@ impl DataActor for Recorder {
         Ok(())
     }
 
-    fn on_mark_price(&mut self, _mark_price: &MarkPriceUpdate) -> anyhow::Result<()> {
+    fn on_mark_price(&mut self, mark_price: &MarkPriceUpdate) -> anyhow::Result<()> {
         bump(&self.counters.mark_prices, 1);
+        let now = nautilus_core::time::get_atomic_clock_realtime().get_time_ns();
+        let age_us = now.as_u64().saturating_sub(mark_price.ts_init.as_u64()) / 1_000;
+        self.counters
+            .mark_dispatch_age_max_us
+            .fetch_max(age_us.saturating_add(1), Ordering::Relaxed);
         Ok(())
     }
 
@@ -170,24 +192,41 @@ impl DataActor for Recorder {
     }
 }
 
+/// Matches sealed `.feather` files and in-progress `.feather.partial` files.
+fn is_staged_file(path: &Path) -> bool {
+    let extension = path.extension();
+    let feather = Some(OsStr::new("feather"));
+    extension == feather
+        || (extension == Some(OsStr::new("partial"))
+            && path
+                .file_stem()
+                .and_then(|stem| Path::new(stem).extension())
+                == feather)
+}
+
 /// Lists the data files under the staging directory.
-fn staged_files(dir: &str) -> BTreeSet<PathBuf> {
-    fn walk(dir: &Path, found: &mut BTreeSet<PathBuf>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
+fn staged_files(dir: &Path) -> anyhow::Result<BTreeSet<PathBuf>> {
+    fn walk(dir: &Path, found: &mut BTreeSet<PathBuf>) -> anyhow::Result<()> {
+        let entries = std::fs::read_dir(dir)
+            .with_context(|| format!("cannot read staging directory {}", dir.display()))?;
+        for entry in entries {
+            let entry =
+                entry.with_context(|| format!("cannot list entries in {}", dir.display()))?;
             let path = entry.path();
-            if path.is_dir() {
-                walk(&path, found);
-            } else if path.to_string_lossy().contains(".feather") {
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("cannot read file type of {}", path.display()))?;
+            if file_type.is_dir() {
+                walk(&path, found)?;
+            } else if is_staged_file(&path) {
                 found.insert(path);
             }
         }
+        Ok(())
     }
     let mut found = BTreeSet::new();
-    walk(Path::new(dir), &mut found);
-    found
+    walk(dir, &mut found)?;
+    Ok(found)
 }
 
 /// Checks that the run's data reached the catalog: nothing of this run left
@@ -196,16 +235,17 @@ fn staged_files(dir: &str) -> BTreeSet<PathBuf> {
 /// stored than were received.
 fn verify(
     catalog_dir: &str,
-    staging: &str,
+    staging: &Path,
     stranded: &BTreeSet<PathBuf>,
     run_start: UnixNanos,
     requested: &[InstrumentId],
     counters: &Counters,
 ) -> anyhow::Result<()> {
-    let unpromoted = staged_files(staging).difference(stranded).count();
+    let unpromoted = staged_files(staging)?.difference(stranded).count();
     anyhow::ensure!(
         unpromoted == 0,
-        "{unpromoted} staged files in {staging} were not promoted into the catalog"
+        "{unpromoted} staged files in {} were not promoted into the catalog",
+        staging.display()
     );
     let mut catalog = crate::open_catalog(catalog_dir);
     let covered: BTreeSet<InstrumentId> = catalog
@@ -285,7 +325,10 @@ pub(crate) async fn record(options: RecordOptions) -> anyhow::Result<()> {
 
     std::fs::create_dir_all(&options.catalog_dir)?;
     let staging_dir = format!("{}.staging", options.catalog_dir.trim_end_matches('/'));
-    let stranded = staged_files(&staging_dir);
+    let staging = Path::new(&staging_dir);
+    std::fs::create_dir_all(staging)
+        .with_context(|| format!("cannot create staging directory {staging_dir}"))?;
+    let stranded = staged_files(staging)?;
     if !stranded.is_empty() {
         log::warn!(
             "{} staged files from an earlier run are in {staging_dir} and are not in \
@@ -335,6 +378,7 @@ pub(crate) async fn record(options: RecordOptions) -> anyhow::Result<()> {
             loop {
                 ticker.tick().await;
                 log::info!("recorded after {}", counters.report(started.elapsed()));
+                counters.report_dispatch_backlog(handle.metrics_snapshot().data_events.queue_depth);
                 if options
                     .duration
                     .is_some_and(|limit| started.elapsed() >= limit)
@@ -352,7 +396,7 @@ pub(crate) async fn record(options: RecordOptions) -> anyhow::Result<()> {
     node.dispose();
     verify(
         &options.catalog_dir,
-        &staging_dir,
+        staging,
         &stranded,
         run_start,
         &requested,
@@ -363,4 +407,34 @@ pub(crate) async fn record(options: RecordOptions) -> anyhow::Result<()> {
         counters.report(started.elapsed())
     );
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staging_matches_sealed_and_partial_feather_files() {
+        assert!(is_staged_file(Path::new("quotes/quotes_0.feather")));
+        assert!(is_staged_file(Path::new("quotes/quotes_0.feather.partial")));
+        assert!(!is_staged_file(Path::new("quotes.feather/notes.txt")));
+        assert!(!is_staged_file(Path::new("quotes/quotes_0.feather.bak")));
+    }
+
+    #[test]
+    fn verification_fails_when_staging_cannot_be_scanned() {
+        let staging = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
+        let error = verify(
+            env!("CARGO_MANIFEST_DIR"),
+            Path::new(staging),
+            &BTreeSet::new(),
+            UnixNanos::default(),
+            &[],
+            &Counters::default(),
+        )
+        .expect_err("verification must fail before querying the catalog");
+        let io_error = error.downcast_ref::<std::io::Error>().unwrap();
+        assert_eq!(io_error.kind(), std::io::ErrorKind::NotADirectory);
+        assert!(error.to_string().contains(staging), "{error:#}");
+    }
 }

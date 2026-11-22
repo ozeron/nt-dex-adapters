@@ -17,12 +17,13 @@ use ustr::Ustr;
 use crate::{
     book::{Action, BookSync, DepthDiff},
     common,
+    config::{BOOK_BUFFER_BYTES, SESSION_BOOK_BUFFER_BYTES},
     http::parse::parse_depth_snapshot,
     websocket::{
-        messages::{AggTrade, BookTicker, DepthUpdate, Envelope, MarkPrice, Trade},
+        messages::{AggTrade, BookTicker, Envelope, InlineDepthUpdate, MarkPrice, Trade},
         parse::{
-            InstrumentSpec, parse_agg_trade, parse_book_ticker, parse_depth_update,
-            parse_mark_price_parts, parse_trade,
+            InstrumentSpec, parse_agg_trade, parse_book_ticker, parse_inline_depth_update,
+            parse_mark_price_parts, parse_trade, validate_inline_depth_update,
         },
     },
 };
@@ -44,7 +45,7 @@ pub enum FeedEvent {
 #[derive(Debug)]
 struct Market {
     spec: InstrumentSpec,
-    book: BookSync,
+    book: BookSync<DepthPayload>,
     /// The latest `ts_init` given to this book's deltas. A snapshot is
     /// stamped when it is applied, which can be after a newer diff left the
     /// socket; later deltas are held to it so the book replays in order.
@@ -55,6 +56,47 @@ struct Market {
     /// The last aggregate trade published, from the separate aggregate id
     /// space. Only old captures carry these.
     last_agg_trade_id: Option<u64>,
+}
+
+#[derive(Debug)]
+enum DepthPayload {
+    Decoded(OrderBookDeltas),
+    Wire {
+        payload: Box<str>,
+        spec: InstrumentSpec,
+        ts_init: UnixNanos,
+    },
+}
+
+impl DepthPayload {
+    fn into_deltas(self) -> anyhow::Result<Option<OrderBookDeltas>> {
+        match self {
+            Self::Decoded(deltas) => Ok(Some(deltas)),
+            Self::Wire {
+                payload,
+                spec,
+                ts_init,
+            } => {
+                let update = serde_json::from_str(&payload).context("invalid buffered depth")?;
+                parse_inline_depth_update(&update, spec, ts_init)
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BookBufferLimits {
+    per_book: usize,
+    session: usize,
+}
+
+impl Default for BookBufferLimits {
+    fn default() -> Self {
+        Self {
+            per_book: BOOK_BUFFER_BYTES,
+            session: SESSION_BOOK_BUFFER_BYTES,
+        }
+    }
 }
 
 /// Checks a trade id against the last one published for its symbol and
@@ -85,8 +127,8 @@ fn market<'a>(
     markets: &'a mut AHashMap<Ustr, Market>,
     raw_symbol: &str,
 ) -> anyhow::Result<&'a mut Market> {
-    markets
-        .get_mut(&Ustr::from(raw_symbol))
+    Ustr::from_existing(raw_symbol)
+        .and_then(|symbol| markets.get_mut(&symbol))
         .with_context(|| format!("no instrument loaded for symbol {raw_symbol}"))
 }
 
@@ -94,7 +136,9 @@ fn market<'a>(
 #[derive(Debug, Default)]
 pub struct AsterFeed {
     markets: AHashMap<Ustr, Market>,
-    deltas: Vec<OrderBookDeltas>,
+    deltas: Vec<DepthPayload>,
+    buffer_limits: BookBufferLimits,
+    buffered_depth_bytes: usize,
     missed_trades: u64,
 }
 
@@ -107,6 +151,15 @@ impl AsterFeed {
             feed.add_instrument(instrument);
         }
         feed
+    }
+
+    pub(crate) fn with_book_buffer_limits(mut self, per_book: usize, session: usize) -> Self {
+        self.buffer_limits = BookBufferLimits { per_book, session };
+        self
+    }
+
+    pub(crate) const fn buffered_depth_bytes(&self) -> usize {
+        self.buffered_depth_bytes
     }
 
     /// Registers an instrument, keeping existing book state if it is known.
@@ -125,7 +178,7 @@ impl AsterFeed {
             })
             .or_insert_with(|| Market {
                 spec,
-                book: BookSync::new(),
+                book: BookSync::empty(),
                 book_ts_floor: UnixNanos::default(),
                 last_trade_id: None,
                 last_agg_trade_id: None,
@@ -145,7 +198,9 @@ impl AsterFeed {
     /// symbols, as parsed from `fundingInfo`. Unknown symbols are ignored.
     pub fn set_funding_intervals(&mut self, intervals: &[(String, u16)]) {
         for (symbol, minutes) in intervals {
-            if let Some(market) = self.markets.get_mut(&Ustr::from(symbol)) {
+            if let Some(symbol) = Ustr::from_existing(symbol)
+                && let Some(market) = self.markets.get_mut(&symbol)
+            {
                 market.spec.funding_interval_mins = Some(*minutes);
             }
         }
@@ -161,16 +216,16 @@ impl AsterFeed {
     /// Returns the instrument id for a venue symbol, if it is known.
     #[must_use]
     pub fn instrument_id(&self, raw_symbol: &str) -> Option<InstrumentId> {
-        self.markets
-            .get(&Ustr::from(raw_symbol))
+        Ustr::from_existing(raw_symbol)
+            .and_then(|symbol| self.markets.get(&symbol))
             .map(|market| market.spec.id)
     }
 
     /// Returns `true` when the symbol's book is in sequence.
     #[must_use]
     pub fn is_book_live(&self, raw_symbol: &str) -> bool {
-        self.markets
-            .get(&Ustr::from(raw_symbol))
+        Ustr::from_existing(raw_symbol)
+            .and_then(|symbol| self.markets.get(&symbol))
             .is_some_and(|market| market.book.is_live())
     }
 
@@ -194,24 +249,95 @@ impl AsterFeed {
         for market in self.markets.values_mut() {
             market.book.reset();
         }
+        self.buffered_depth_bytes = 0;
     }
 
     /// Forgets one book's progress, as when its subscription is dropped.
     pub fn reset_book(&mut self, raw_symbol: &str) {
-        if let Some(market) = self.markets.get_mut(&Ustr::from(raw_symbol)) {
+        if let Some(symbol) = Ustr::from_existing(raw_symbol)
+            && let Some(market) = self.markets.get_mut(&symbol)
+        {
+            self.buffered_depth_bytes = self
+                .buffered_depth_bytes
+                .saturating_sub(market.book.buffered_bytes());
             market.book.reset();
         }
     }
 
-    fn drain_deltas(&mut self, action: &Action, symbol: &str, out: &mut Vec<FeedEvent>) {
-        out.extend(
-            self.deltas
-                .drain(..)
-                .map(|deltas| FeedEvent::Data(Data::BookDeltas(Box::new(deltas)))),
-        );
-        if *action == Action::RequestSnapshot {
+    fn drain_deltas(
+        &mut self,
+        action: Action,
+        symbol: &str,
+        ts_floor: Option<UnixNanos>,
+        out: &mut Vec<FeedEvent>,
+    ) -> anyhow::Result<()> {
+        for payload in self.deltas.drain(..) {
+            if let Some(mut deltas) = payload.into_deltas()? {
+                // Buffered diffs enter the catalog with the snapshot. Their
+                // receive timestamp cannot precede the snapshot in replay.
+                if let Some(floor) = ts_floor
+                    && deltas.ts_init < floor
+                {
+                    deltas.ts_init = floor;
+                    for delta in &mut deltas.deltas {
+                        delta.ts_init = floor;
+                    }
+                }
+                out.push(FeedEvent::Data(Data::BookDeltas(Box::new(deltas))));
+            }
+        }
+        if action == Action::RequestSnapshot {
             out.push(FeedEvent::SnapshotRequired(Ustr::from(symbol)));
         }
+        Ok(())
+    }
+
+    fn handle_depth_diff(
+        &mut self,
+        payload: &str,
+        ts_init: UnixNanos,
+        out: &mut Vec<FeedEvent>,
+    ) -> anyhow::Result<()> {
+        let update: InlineDepthUpdate<'_> =
+            serde_json::from_str(payload).context("invalid depth")?;
+        let market = market(&mut self.markets, update.symbol)?;
+        let ts_init = ts_init.max(market.book_ts_floor);
+        let other_bytes = self
+            .buffered_depth_bytes
+            .saturating_sub(market.book.buffered_bytes());
+        let budget = self
+            .buffer_limits
+            .session
+            .saturating_sub(other_bytes)
+            .min(self.buffer_limits.per_book);
+        let mut diff = DepthDiff {
+            final_update_id: update.final_update_id,
+            prev_final_update_id: update.prev_final_update_id,
+            deltas: None,
+        };
+        let mut bytes = 0;
+        if market.book.buffers(&diff) {
+            validate_inline_depth_update(&update, market.spec)?;
+            if !update.bids.is_empty() || !update.asks.is_empty() {
+                bytes = payload.len();
+                // An oversized diff advances the eviction watermark without copying its payload.
+                if BookSync::<DepthPayload>::payload_fits(bytes, budget) {
+                    diff.deltas = Some(DepthPayload::Wire {
+                        payload: payload.into(),
+                        spec: market.spec,
+                        ts_init,
+                    });
+                }
+            }
+        } else {
+            diff.deltas = parse_inline_depth_update(&update, market.spec, ts_init)?
+                .map(DepthPayload::Decoded);
+        }
+        let action = market
+            .book
+            .on_diff_with_budget(diff, bytes, budget, &mut self.deltas);
+        self.buffered_depth_bytes = other_bytes.saturating_add(market.book.buffered_bytes());
+        self.drain_deltas(action, update.symbol, None, out)
     }
 
     /// Handles one text frame from the combined stream.
@@ -228,7 +354,15 @@ impl AsterFeed {
         ts_init: UnixNanos,
         out: &mut Vec<FeedEvent>,
     ) -> anyhow::Result<()> {
-        let envelope: Envelope = serde_json::from_str(text).context("invalid stream frame")?;
+        self.handle_envelope(&Envelope::parse(text)?, ts_init, out)
+    }
+
+    pub(crate) fn handle_envelope(
+        &mut self,
+        envelope: &Envelope<'_>,
+        ts_init: UnixNanos,
+        out: &mut Vec<FeedEvent>,
+    ) -> anyhow::Result<()> {
         let (Some(stream), Some(data)) = (envelope.stream, envelope.data) else {
             return Ok(());
         };
@@ -236,21 +370,7 @@ impl AsterFeed {
         let channel = stream.split('@').nth(1).unwrap_or_default();
 
         match channel {
-            "depth" => {
-                let update: DepthUpdate = serde_json::from_str(payload).context("invalid depth")?;
-                let market = market(&mut self.markets, update.symbol)?;
-                let diff = DepthDiff {
-                    final_update_id: update.final_update_id,
-                    prev_final_update_id: update.prev_final_update_id,
-                    deltas: parse_depth_update(
-                        &update,
-                        market.spec,
-                        ts_init.max(market.book_ts_floor),
-                    )?,
-                };
-                let action = market.book.on_diff(diff, &mut self.deltas);
-                self.drain_deltas(&action, update.symbol, out);
-            }
+            "depth" => self.handle_depth_diff(payload, ts_init, out)?,
             "trade" => {
                 let trade: Trade = serde_json::from_str(payload).context("invalid trade")?;
                 let market = market(&mut self.markets, trade.symbol)?;
@@ -333,22 +453,16 @@ impl AsterFeed {
             spec.size_precision,
             ts_init,
         )?;
-        let action =
-            market
-                .book
-                .on_snapshot(snapshot.last_update_id, snapshot.deltas, &mut self.deltas);
-        // Diffs buffered while waiting enter the system now, with the snapshot.
-        // Restamping keeps `ts_init` non-decreasing, which the catalog requires.
-        for deltas in &mut self.deltas {
-            if deltas.ts_init < ts_init {
-                deltas.ts_init = ts_init;
-                for delta in &mut deltas.deltas {
-                    delta.ts_init = ts_init;
-                }
-            }
-        }
-        self.drain_deltas(&action, raw_symbol, out);
-        Ok(())
+        let other_bytes = self
+            .buffered_depth_bytes
+            .saturating_sub(market.book.buffered_bytes());
+        let action = market.book.on_snapshot(
+            snapshot.last_update_id,
+            DepthPayload::Decoded(snapshot.deltas),
+            &mut self.deltas,
+        );
+        self.buffered_depth_bytes = other_bytes.saturating_add(market.book.buffered_bytes());
+        self.drain_deltas(action, raw_symbol, Some(ts_init), out)
     }
 }
 
@@ -356,4 +470,44 @@ impl AsterFeed {
 #[must_use]
 pub fn stream_symbol(instrument_id: &InstrumentId) -> String {
     common::raw_symbol(instrument_id).to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::http::parse::parse_exchange_info;
+
+    use super::*;
+
+    #[test]
+    fn recovering_books_share_one_session_budget_and_reset_releases_it() {
+        let time = UnixNanos::default();
+        let exchange_info = include_str!("../test_data/http_exchange_info.json");
+        let instruments = parse_exchange_info(exchange_info, time)
+            .unwrap()
+            .instruments;
+        let mut feed = AsterFeed::new(&instruments).with_book_buffer_limits(512, 300);
+        let mut events = Vec::new();
+        let sol = r#"{"stream":"solusdt@depth@100ms","data":{"T":1,"s":"SOLUSDT","U":10,"u":10,"pu":9,"b":[["70","1"]],"a":[]}}"#;
+        let btc = sol
+            .replace("solusdt", "btcusdt")
+            .replace("SOLUSDT", "BTCUSDT");
+        feed.handle_text(sol, time, &mut events).unwrap();
+        assert!(feed.buffered_depth_bytes() > 0);
+        let sol_bytes = feed.buffered_depth_bytes();
+
+        feed.handle_text(&btc, time, &mut events).unwrap();
+        assert_eq!(feed.buffered_depth_bytes(), sol_bytes);
+        assert_eq!(events.len(), 2, "both books still request snapshots");
+        assert!(
+            events
+                .iter()
+                .all(|event| matches!(event, FeedEvent::SnapshotRequired(_)))
+        );
+
+        feed.reset_book("SOLUSDT");
+        assert_eq!(feed.buffered_depth_bytes(), 0);
+        events.clear();
+        feed.handle_text(&btc, time, &mut events).unwrap();
+        assert_eq!(feed.buffered_depth_bytes(), sol_bytes);
+    }
 }
