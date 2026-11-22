@@ -34,12 +34,14 @@ The book is built from depth diffs on `<symbol>@depth@100ms`, seeded by a REST s
 
 Update ids (`U`, `u`, `pu`) are venue-global: they are shared across symbols, so one symbol's consecutive diffs are not numerically adjacent. In the capture `pu` equalled the previous `u` for 15,107 of 15,107 consecutive BTCUSDT diffs. The adapter handles each book as follows:
 
-1. The first diff for a book starts a snapshot request. Diffs arriving meanwhile are held, up to 20,000 per book; beyond that the wait is abandoned and restarted.
-2. When the snapshot (`lastUpdateId`) arrives, held diffs with `u <= lastUpdateId` are dropped. The first diff kept must have `pu <= lastUpdateId`; if `pu > lastUpdateId` the snapshot is too old and a new one is requested.
+1. The first diff queues a paced snapshot request. While waiting, the adapter validates the diffs and retains compact wire payloads, timestamps, and sequence IDs. It keeps the newest suffix within the 20,000-diff count limit and the configurable `book_buffer_bytes` and `session_book_buffer_bytes` budgets (4 MiB per book and 64 MiB per session by default).
+2. When the snapshot (`lastUpdateId`) arrives, held diffs with `u <= lastUpdateId` are dropped. The snapshot must cover every evicted diff. The first remaining diff must have `pu <= lastUpdateId`, otherwise the adapter requests another snapshot. Only the updates applied to the book are expanded into Nautilus deltas.
 3. After that, every diff must have `pu` equal to the previous diff's `u`. Otherwise the book has a gap: the diff is held, a new snapshot is requested, and nothing is emitted for that book until it arrives.
 4. A WebSocket reconnect resets every book carried by that connection and requests new snapshots. A changed instrument definition resets that book too.
 
-Until a book has its first snapshot the catalog has nothing for it. Snapshots are paced to the venue's request weight (`snapshot_weight_per_minute`, default 1800 of the 2400 per minute the venue's `exchangeInfo` lists). A 1000-level snapshot weighs 20, so one is requested every 0.67 s. With all 595 books subscribed at once the last one syncs about 6.6 minutes after start (595 x 0.67 s). A reconnect of a connection with many books is paced the same way.
+Until a book has its first snapshot the catalog has nothing for it. Snapshots are paced to the venue's request weight (`snapshot_weight_per_minute`, default 1800 of the 2400 per minute the venue's `exchangeInfo` lists). A 1000-level snapshot weighs 20, so one is requested every 0.67 s. The first pass of requests for 595 books takes about 6.6 minutes at that rate. Books that need a newer snapshot can take longer. A reconnect of a connection with many books is paced the same way.
+
+The adapter logs queued frame counts, estimated ingress bytes, age of the queue head, pending book bytes, and snapshot jobs. The recorder also logs the Nautilus runner's sampled event count, estimated inline queue bytes, and the maximum socket-to-actor age of mark prices in each reporting window. Mark age includes processing before dispatch. The runner's byte estimate excludes owned book payloads.
 
 ### Recognising a resync in the catalog
 

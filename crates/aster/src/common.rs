@@ -128,12 +128,13 @@ pub fn quantity(value: &str, precision: u8) -> anyhow::Result<Quantity> {
 /// Fails when `value` has more decimals than `precision` holds. Rounding a
 /// book level or a trade would move it to another price or change its size,
 /// and can turn a small quantity into zero, which deletes the level.
-fn ensure_exact(value: &str, precision: u8) -> anyhow::Result<()> {
+fn exact_decimal(value: &str, precision: u8) -> anyhow::Result<Decimal> {
+    let parsed = decimal(value)?;
     anyhow::ensure!(
-        decimal(value)?.normalize().scale() <= u32::from(precision),
+        parsed.normalize().scale() <= u32::from(precision),
         "'{value}' has more decimals than the instrument's precision {precision}"
     );
-    Ok(())
+    Ok(parsed)
 }
 
 /// Parses a market-data price, which must fit the instrument's precision.
@@ -142,8 +143,8 @@ fn ensure_exact(value: &str, precision: u8) -> anyhow::Result<()> {
 ///
 /// Returns an error if `value` is not a decimal or needs rounding.
 pub fn exact_price(value: &str, precision: u8) -> anyhow::Result<Price> {
-    ensure_exact(value, precision)?;
-    price(value, precision)
+    Price::from_decimal_dp(exact_decimal(value, precision)?, precision)
+        .with_context(|| format!("invalid price '{value}' at precision {precision}"))
 }
 
 /// Parses a market-data quantity, which must fit the instrument's precision.
@@ -153,8 +154,8 @@ pub fn exact_price(value: &str, precision: u8) -> anyhow::Result<Price> {
 /// Returns an error if `value` is not a non-negative decimal or needs
 /// rounding.
 pub fn exact_quantity(value: &str, precision: u8) -> anyhow::Result<Quantity> {
-    ensure_exact(value, precision)?;
-    quantity(value, precision)
+    Quantity::from_decimal_dp(exact_decimal(value, precision)?, precision)
+        .with_context(|| format!("invalid quantity '{value}' at precision {precision}"))
 }
 
 /// A trade as the venue reports it, whichever endpoint or stream it came from.
@@ -196,7 +197,7 @@ pub fn trade_tick(
         exact_price(trade.price, price_precision)?,
         size,
         aggressor_side,
-        TradeId::new(trade.id.to_string()),
+        TradeId::new(itoa::Buffer::new().format(trade.id)),
         millis(trade.time_ms)?,
         ts_init,
     ))

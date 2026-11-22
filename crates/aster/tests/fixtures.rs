@@ -474,6 +474,16 @@ fn bad_frames_are_errors_and_do_not_poison_the_feed() {
 }
 
 #[test]
+fn rejected_symbols_are_not_interned() {
+    let mut feed = AsterFeed::new(&instruments());
+    let symbol = "UNKNOWN_WIRE_TEST_SYMBOL";
+    let frame = WS_AGG_TRADE.replace("SOLUSDT", symbol);
+    assert!(ustr::Ustr::from_existing(symbol).is_none());
+    assert!(feed.handle_text(&frame, TS_INIT, &mut Vec::new()).is_err());
+    assert!(ustr::Ustr::from_existing(symbol).is_none());
+}
+
+#[test]
 fn funding_info_gives_intervals_in_minutes() {
     let intervals = parse_funding_intervals(FUNDING_INFO).unwrap();
     assert!(intervals.contains(&("SOLUSDT".to_owned(), 480)));
