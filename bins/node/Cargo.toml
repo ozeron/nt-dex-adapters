@@ -9,5 +9,8 @@ publish.workspace = true
 nautilus-binance.workspace = true
 nautilus-hyperliquid.workspace = true
 nautilus-lighter.workspace = true
-nautilus-live.workspace = true
+nautilus-live = { workspace = true, features = ["streaming"] }
 nautilus-persistence.workspace = true
+
+[lints]
+workspace = true

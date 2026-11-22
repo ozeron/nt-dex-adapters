@@ -4411,27 +4411,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nt-dex-edgex"
-version = "0.1.0"
-dependencies = [
- "nautilus-model",
-]
-
-[[package]]
-name = "nt-dex-extended"
-version = "0.1.0"
-dependencies = [
- "nautilus-model",
-]
-
-[[package]]
-name = "nt-dex-grvt"
-version = "0.1.0"
-dependencies = [
- "nautilus-model",
-]
-
-[[package]]
 name = "nt-dex-node"
 version = "0.1.0"
 dependencies = [

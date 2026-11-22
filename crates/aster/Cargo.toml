@@ -7,3 +7,6 @@ publish.workspace = true
 
 [dependencies]
 nautilus-model.workspace = true
+
+[lints]
+workspace = true
