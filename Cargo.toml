@@ -2,11 +2,12 @@
 resolver = "3"
 members = [
     "crates/aster",
-    "crates/edgex",
-    "crates/extended",
-    "crates/grvt",
     "bins/node",
+    "tools/capture",
 ]
+# Bare `cargo check` / `cargo test` touch only the venue under development.
+# Use `--workspace` (or `scripts/gate.sh`) to include the node.
+default-members = ["crates/aster"]
 
 [workspace.package]
 version = "0.1.0"
@@ -21,7 +22,59 @@ nautilus-common = { version = "=0.68.0", features = ["live"] }
 nautilus-core = "=0.68.0"
 nautilus-hyperliquid = "=0.68.0"
 nautilus-lighter = "=0.68.0"
-nautilus-live = { version = "=0.68.0", default-features = false, features = ["streaming"] }
+# No features here: `streaming` pulls in persistence and datafusion, so only
+# the node enables it. Adapter crates stay light.
+nautilus-live = { version = "=0.68.0", default-features = false }
 nautilus-model = { version = "=0.68.0", features = ["high-precision"] }
 nautilus-network = { version = "=0.68.0", features = ["transport-sockudo"] }
 nautilus-persistence = "=0.68.0"
+nautilus-testkit = { version = "=0.68.0", features = ["testers"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unused_qualifications = "warn"
+
+# Levels are "warn" so the edit loop is never blocked; scripts/gate.sh runs
+# clippy with `-D warnings`, which makes every one of these a hard failure.
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Pedantic opt-outs
+must_use_candidate = "allow"
+# No panics on venue input: a bad frame must become an error, not a crash.
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+indexing_slicing = "warn"
+string_slice = "warn"
+unreachable = "warn"
+# Numeric conversions on prices, sizes, and timestamps must be explicit.
+as_conversions = "warn"
+# Sequence numbers and timestamps: overflow must be handled, not assumed away.
+arithmetic_side_effects = "warn"
+# No leftovers
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+undocumented_unsafe_blocks = "warn"
+
+[profile.dev]
+debug = "line-tables-only"
+
+# Dependencies are optimised: they compile once, and replaying a capture
+# through unoptimised serde and decimal code is several times slower.
+[profile.dev.package."*"]
+debug = false
+opt-level = 2
+
+# Opt-in full debug info for a debugger session: `cargo build --profile debugging`.
+[profile.debugging]
+inherits = "dev"
+debug = true
+
+[profile.debugging.package."*"]
+debug = true
