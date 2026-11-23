@@ -6,7 +6,7 @@ Scope the connector to public data for USD-settled linear perpetuals. Follow the
 
 ## Scope and capture
 
-- [x] Register [`nt-dex-ondo-perps`](../crates/ondo-perps/Cargo.toml) in the workspace.
+- [ ] Register `nt-dex-ondo-perps` in the workspace after Variational qualifies.
 - [x] Verify anonymous production REST metadata and public WebSocket subscriptions, starting with live `US500-USD.P` trades. Record advertised limits, observed subscription behavior, and remaining gaps below.
 - [x] Save raw trade responses spanning more than a UTC day and live WebSocket examples of startup, history, steady state, and reconnect. Include UTC receive stamps and provenance in the [fixture inventory](../crates/ondo-perps/test_data/README.md).
 - [ ] Check metadata across session boundaries and capture market pauses if observed.
@@ -56,7 +56,7 @@ An isolated Rust probe built against the workspace's NautilusTrader RC9 librarie
 
 All 175 `TradeTick`s and 2,345 `QuoteTick`s resolved through the cache and matched the published price and size grids with exact decimals. The quotes were two-sided and uncrossed. The probe parsed venue event times at nanosecond resolution, supplied local receive times separately, and saw acknowledgements for subscription and unsubscribe on both channels. Periodic REST checkpoints matched all 175 live fills field for field, with no extra REST fills inside each symbol's observed live trade time range. Offline negative controls rejected an off-grid price and an unlisted symbol.
 
-The probe source, raw capture, and JSON summary are local under `captures/ondo-perps/`. The Ondo crate compiles with `cargo test --locked --offline -p nt-dex-ondo-perps` and currently has zero crate tests. The instrument request path, live data client, and catalog streaming remain pending. [Local capture inventory](../crates/ondo-perps/test_data/README.md#full-local-captures)
+The isolated probe source, raw capture, and JSON summary are local under `captures/ondo-perps/`. Workspace registration, instrument requests, the live data client, and catalog streaming remain pending. [Local capture inventory](../crates/ondo-perps/test_data/README.md#full-local-captures)
 
 ### Trades, startup, and replay inputs
 
@@ -90,7 +90,7 @@ REST `GET /v1/perps/depth?market=US500-USD.P&depth=10` supplied the same ungroup
 | Bars | `kLinePerps` emitted provisional and closed candles (`x`) with Unix seconds (`t`, `s`, `e`) and numeric OHLCV. A close can arrive after the bar's end. UDF history returned data for `US500USD.P` from `/v1/perps/symbol_info`. Anonymous `/v1/perps/candles` returned 401 `auth_missing`. | Use UDF bars as an independent trade aggregate. Bar projection is deferred. |
 | Volume and open interest | Anonymous `/v1/perps/volume` and `/v1/perps/open_interest` returned snapshots. | Scope evidence only. |
 
-The connector is a Rust data client for market data. Spot, accounts, private streams, execution, Python bindings, options, and DeFi pools are outside its scope. [Other WebSocket fixtures](../crates/ondo-perps/test_data/other-ws.jsonl) · [Reference REST fixtures](../crates/ondo-perps/test_data/reference-rest.jsonl) · [Mark mechanics](https://docs.ondoperps.xyz/weekend-trading) · [Funding mechanics](https://docs.ondoperps.xyz/funding-rates) · [Contracts](https://docs.ondoperps.xyz/api-reference/market-data/get-contracts)
+The planned Rust client covers public market data. Spot, accounts, private streams, execution, Python bindings, options, and DeFi pools are outside its scope. [Other WebSocket fixtures](../crates/ondo-perps/test_data/other-ws.jsonl) · [Reference REST fixtures](../crates/ondo-perps/test_data/reference-rest.jsonl) · [Mark mechanics](https://docs.ondoperps.xyz/weekend-trading) · [Funding mechanics](https://docs.ondoperps.xyz/funding-rates) · [Contracts](https://docs.ondoperps.xyz/api-reference/market-data/get-contracts)
 
 ## Evidence by NautilusTrader checklist ID
 
@@ -98,7 +98,7 @@ The connector is a Rust data client for market data. Spot, accounts, private str
 | --- | --- |
 | `NT-P0.1`, `NT-P0.3`, `NT-P0.4`, `NT-P0-EXIT` | Scope recorded above. First path is REST instrument to a live US500 trade to streaming catalog, promotion, readback, and replay. Independent venue bar data is available. |
 | `NT-P0.2` | Public/private boundary, production/sandbox differences, documented limits, and observed venue constraints recorded. Load ceilings and session transitions are open. |
-| `NT-P0.5` | `cargo metadata --locked --offline --no-deps --format-version 1` discovers the Rust crate and its library test target. Connector and node wiring are pending. |
+| `NT-P0.5` | Pending until Variational qualifies. The fixture directory is available and Ondo has no Cargo workspace member. |
 | `NT-P1.3`, `NT-P1.7`, `NT-TEST-FIXTURES` | Raw inputs and wire semantics recorded. Typed connector models and fixture-backed tests are pending. |
 | `NT-P2.1`, `NT-P2.2`, `NT-P2.3`, `NT-DATA-TIMESTAMPS`, `TC-D01`, `TC-D03` | The live model probe loaded and resolved 84 definitions in the NautilusTrader cache and parsed live trades and quotes with event and receive times. The data-client requests and DataTester cases are pending. |
 | `NT-P3.1`, `NT-P3.2`, `NT-P3.5`, `NT-WS-RECOVERY`, `TC-D20`, `TC-D30`, `TC-D31`, `TC-D70` | Venue probes exercised the inputs. Adapter event delivery, recovery, retirement, and test lifecycle are pending. |
