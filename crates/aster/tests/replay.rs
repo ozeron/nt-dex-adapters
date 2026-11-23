@@ -31,11 +31,8 @@ use nt_dex_aster::{
 use rust_decimal::Decimal;
 use serde_json::Value;
 
-/// Levels per side compared exactly against each checkpoint snapshot.
 const CHECK_DEPTH: usize = 100;
 const MINUTE_MS: u64 = 60_000;
-/// Klines that closed less than this before they were fetched are not
-/// compared: the venue's REST klines trail its trade stream.
 const KLINE_SETTLE_MS: u64 = 60_000;
 
 fn capture_path() -> Option<PathBuf> {
@@ -84,7 +81,6 @@ fn dec(value: &Value) -> Decimal {
     Decimal::from_str(value.as_str().unwrap()).unwrap()
 }
 
-/// A venue snapshot to compare the rebuilt book against.
 struct Checkpoint {
     last_update_id: u64,
     bids: Vec<(Decimal, Decimal)>,
@@ -109,11 +105,8 @@ fn checkpoint(raw: &str) -> Checkpoint {
     }
 }
 
-/// Counts top-of-book levels where the book and the snapshot disagree,
-/// ignoring prices the bridging diff is about to change.
 fn mismatches(book: &OrderBook, checkpoint: &Checkpoint, touched: &HashSet<Decimal>) -> usize {
     let sides = [
-        // Our whole side: the bridging diff can shift which levels are top-N.
         (book.bids_as_map(None), &checkpoint.bids, true),
         (book.asks_as_map(None), &checkpoint.asks, false),
     ];
@@ -152,11 +145,9 @@ struct SymbolStats {
     marks: usize,
     snapshots_applied: usize,
     checkpoints: usize,
-    /// Checkpoints taken exactly at a diff's final update id.
     exact_checkpoints: usize,
     checkpoint_mismatches: usize,
     crossed: usize,
-    /// Minute open time (ms) -> (volume, trade count) from trades (aggregate in old captures).
     minutes: BTreeMap<u64, (Decimal, u64)>,
 }
 
@@ -173,7 +164,6 @@ fn replay_capture_matches_venue() {
         path.display()
     );
 
-    // Instruments.
     let exchange_info = records
         .iter()
         .find(|r| r.source.ends_with("exchangeInfo"))
@@ -190,7 +180,6 @@ fn replay_capture_matches_venue() {
         parsed.skipped.len()
     );
 
-    // Later depth snapshots are checkpoints, queued per symbol.
     let mut checkpoints: HashMap<String, VecDeque<Checkpoint>> = HashMap::new();
     let mut symbols = Vec::new();
     for record in records
@@ -247,9 +236,6 @@ fn replay_capture_matches_venue() {
                 if is_agg || record.raw.contains("\"e\":\"trade\"") {
                     let frame: Value = serde_json::from_str(&record.raw).unwrap();
                     let data = &frame["data"];
-                    // The fill count is not carried by `TradeTick`, so it comes
-                    // from the raw frame: one for a trade, `f..=l` for an
-                    // aggregate. Volume comes from the emitted tick.
                     let minute = data["T"].as_u64().unwrap() / MINUTE_MS * MINUTE_MS;
                     let fills = if is_agg {
                         data["l"].as_u64().unwrap() - data["f"].as_u64().unwrap() + 1
@@ -268,7 +254,6 @@ fn replay_capture_matches_venue() {
             ("rest", source) if source.contains("/depth?") => {
                 let symbol = query_symbol(source);
                 if awaiting_snapshot.remove(&symbol) {
-                    // The feed asked for this one: it bootstraps the book.
                     checkpoints.get_mut(&symbol).unwrap().pop_front();
                     feed.handle_depth_snapshot(&symbol, &record.raw, record.ts, &mut events)
                         .unwrap();
@@ -288,9 +273,6 @@ fn replay_capture_matches_venue() {
                     let book = books.get_mut(symbol).unwrap();
                     let stat = stats.entry(symbol.clone()).or_default();
 
-                    // The book is now at the state just before these deltas.
-                    // A checkpoint taken inside their update-id range
-                    // describes that state, except at the prices they change.
                     let queue = checkpoints.get_mut(symbol).unwrap();
                     while queue
                         .front()
@@ -309,8 +291,6 @@ fn replay_capture_matches_venue() {
                     book.apply_deltas(&deltas).unwrap();
                     stat.deltas += deltas.deltas.len();
 
-                    // A checkpoint taken exactly at their final update id
-                    // describes the book now, at every price.
                     while queue
                         .front()
                         .is_some_and(|c| c.last_update_id == deltas.sequence)
@@ -353,7 +333,6 @@ fn replay_capture_matches_venue() {
         }
     }
 
-    // Venue klines: compare each fully captured minute.
     let mut minutes_checked = 0;
     for record in records
         .iter()
@@ -420,7 +399,6 @@ fn replay_capture_matches_venue() {
     }
     eprintln!("{minutes_checked} symbol-minutes reconciled against klines");
 
-    // A capture with nothing to reconcile proves nothing: fail, not pass.
     let total_trades: usize = stats.values().map(|stat| stat.trades).sum();
     assert!(total_trades > 0, "capture contains no trades");
     if last_ws_ms.saturating_sub(first_ws_ms) > 4 * MINUTE_MS {

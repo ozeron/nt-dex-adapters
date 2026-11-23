@@ -21,25 +21,13 @@ use crate::common::{self, RawTrade};
 const STATUS_TRADING: &str = "TRADING";
 const CONTRACT_PERPETUAL: &str = "PERPETUAL";
 
-/// Instruments parsed from `exchangeInfo`, plus the symbols left out.
 #[derive(Debug)]
 pub struct ParsedInstruments {
     pub instruments: Vec<InstrumentAny>,
-    /// Symbols that are not trading perpetuals (settling, pending, ...).
     pub skipped: Vec<String>,
-    /// Trading perpetuals whose definition could not be mapped.
     pub failed: Vec<(String, anyhow::Error)>,
 }
 
-/// Parses an `exchangeInfo` body into perpetual instruments.
-///
-/// Symbols that are not `TRADING` perpetuals are listed in `skipped`. A
-/// symbol that should load but has a malformed definition is listed in
-/// `failed` rather than failing the whole load.
-///
-/// # Errors
-///
-/// Returns an error if `body` is not valid `exchangeInfo` JSON.
 pub fn parse_exchange_info(body: &str, ts_init: UnixNanos) -> anyhow::Result<ParsedInstruments> {
     let info: ExchangeInfo = serde_json::from_str(body).context("invalid exchangeInfo")?;
     let mut parsed = ParsedInstruments {
@@ -60,12 +48,6 @@ pub fn parse_exchange_info(body: &str, ts_init: UnixNanos) -> anyhow::Result<Par
     Ok(parsed)
 }
 
-/// Parses a `fundingInfo` body into minutes between funding payments, by
-/// venue symbol.
-///
-/// # Errors
-///
-/// Returns an error if `body` is not valid `fundingInfo` JSON.
 pub fn parse_funding_intervals(body: &str) -> anyhow::Result<Vec<(String, u16)>> {
     let entries: Vec<FundingInfo> = serde_json::from_str(body).context("invalid fundingInfo")?;
     Ok(entries
@@ -77,17 +59,6 @@ pub fn parse_funding_intervals(body: &str) -> anyhow::Result<Vec<(String, u16)>>
         .collect())
 }
 
-/// Parses `GET /fapi/v1/fundingRate` into settled funding rates, oldest
-/// first.
-///
-/// A row's interval is the time since the payment before it, to the nearest
-/// minute. The venue has changed intervals over time, so today's interval
-/// does not describe past payments. `previous_ms` is the payment before the
-/// first row when it is known; without it the first row has no interval.
-///
-/// # Errors
-///
-/// Returns an error if the body is not valid or a rate does not parse.
 pub fn parse_funding_rates(
     body: &str,
     instrument_id: InstrumentId,
@@ -118,11 +89,6 @@ pub fn parse_funding_rates(
         .collect()
 }
 
-/// Parses `GET /fapi/v1/trades` into trade ticks, oldest first.
-///
-/// # Errors
-///
-/// Returns an error if the body is not valid or a trade does not parse.
 pub fn parse_trades(
     body: &str,
     instrument_id: InstrumentId,
@@ -166,22 +132,11 @@ fn required<'a>(value: Option<&'a String>, field: &str) -> anyhow::Result<&'a st
         .with_context(|| format!("missing {field}"))
 }
 
-/// Converts a percent string such as `"5.0000"` into the fraction `0.05`.
 fn percent(value: Option<&String>) -> Option<Decimal> {
     let percent = Decimal::from_str(value?).ok()?;
     percent.checked_div(Decimal::ONE_HUNDRED)
 }
 
-/// Parses one trading perpetual.
-///
-/// Precision follows the venue's `pricePrecision` and `quantityPrecision`,
-/// which is how prices and sizes are formatted on the wire. `tickSize` and
-/// `stepSize` are rescaled to that precision, so a tick of `0.0100` on a
-/// four-decimal symbol stays a 0.01 increment.
-///
-/// # Errors
-///
-/// Returns an error if a required filter or field is missing or malformed.
 pub fn parse_instrument(symbol: &SymbolInfo, ts_init: UnixNanos) -> anyhow::Result<InstrumentAny> {
     let price_precision = symbol.price_precision;
     let size_precision = symbol.quantity_precision;
@@ -243,20 +198,12 @@ fn optional_quantity(value: Option<&String>, precision: u8) -> Option<Quantity> 
     common::quantity(value?, precision).ok()
 }
 
-/// A REST depth snapshot converted to book deltas.
 #[derive(Debug)]
 pub struct BookSnapshot {
     pub last_update_id: u64,
-    /// A clear followed by one add per level, flagged as a snapshot.
     pub deltas: OrderBookDeltas,
 }
 
-/// Parses a `depth` body into a book-replacing set of deltas.
-///
-/// # Errors
-///
-/// Returns an error if the body is not valid depth JSON or a level does not
-/// parse at the given precisions.
 pub fn parse_depth_snapshot(
     body: &str,
     instrument_id: InstrumentId,

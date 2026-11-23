@@ -60,7 +60,6 @@ fn levels(rows: &[[&str; 2]]) -> Result<Levels> {
     Ok(levels)
 }
 
-/// Keeps both arrival orders. Only two views with exactly the same update ID can pair.
 #[derive(Debug, Default)]
 pub(super) struct Pairing {
     local_pending: BTreeMap<u64, (Top, Option<usize>)>,

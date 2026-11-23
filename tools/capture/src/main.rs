@@ -35,15 +35,10 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 const REST_BASE: &str = "https://fapi.asterdex.com";
 const WS_BASE: &str = "wss://fstream.asterdex.com";
 const STREAMS: [&str; 4] = ["depth@100ms", "trade", "bookTicker", "markPrice@1s"];
-/// Delay before the first depth snapshot, so diffs are already buffered.
 const FIRST_SNAPSHOT_DELAY: Duration = Duration::from_secs(2);
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 const PROGRESS_EVERY: Duration = Duration::from_secs(60);
-/// One-minute candles per klines request (the venue's maximum).
 const KLINE_PAGE: u128 = 1000;
-/// Wait before fetching closing klines: the venue's REST klines trail its
-/// trade stream, and a minute read 10 seconds after it closed was still
-/// missing half its trades.
 const KLINE_SETTLE_DELAY: Duration = Duration::from_secs(60);
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -55,7 +50,6 @@ struct Args {
     out_dir: PathBuf,
 }
 
-/// One captured line, stamped when it was received.
 struct Record {
     ts_recv_ns: u64,
     kind: &'static str,
@@ -137,7 +131,6 @@ fn parse_args() -> Result<Args, BoxError> {
     Ok(args)
 }
 
-/// Fetches `path` and queues the body (or the failure) for recording.
 async fn fetch(http: reqwest::Client, path: String, records: UnboundedSender<Record>) {
     let url = format!("{REST_BASE}{path}");
     let body = async {
@@ -152,7 +145,6 @@ async fn fetch(http: reqwest::Client, path: String, records: UnboundedSender<Rec
         Ok(text) => Record::now("rest", path, text),
         Err(error) => Record::now("meta", "rest_error", format!("{path}: {error}")),
     };
-    // The receiver only closes when the session is over.
     let _ = records.send(record);
 }
 
@@ -163,8 +155,6 @@ fn spawn_snapshots(http: &reqwest::Client, symbols: &[String], records: &Unbound
     }
 }
 
-/// Reads one socket until it closes or the session ends. Returns `true` when
-/// the session is over and `false` when the caller should reconnect.
 async fn run_socket(
     args: &Args,
     http: &reqwest::Client,
@@ -186,7 +176,6 @@ async fn run_socket(
     let url = format!("{WS_BASE}/stream?streams={}", streams.join("/"));
 
     let mut socket = match timeout_at(deadline, connect_async(&url)).await {
-        // The session ran out while the venue was unreachable.
         Err(_elapsed) => return Ok(true),
         Ok(Ok((socket, _response))) => socket,
         Ok(Err(error)) => {
@@ -253,7 +242,6 @@ async fn main() -> Result<(), BoxError> {
         .out_dir
         .join(format!("aster-{}.jsonl", started.as_secs()));
     let mut recorder = Recorder {
-        // Never overwrite an earlier session.
         file: BufWriter::new(File::create_new(&path)?),
         ws_frames: 0,
         rest_calls: 0,
@@ -308,14 +296,11 @@ async fn main() -> Result<(), BoxError> {
         sleep(RECONNECT_DELAY).await;
     }
 
-    // Venue statistics for the captured window, to reconcile against.
     eprintln!("stream closed; waiting {KLINE_SETTLE_DELAY:?} for klines to settle");
     sleep(KLINE_SETTLE_DELAY).await;
-    // Start one minute early so the partially captured first candle is included.
     let start_ms = started.as_millis().saturating_sub(60_000);
     let end_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
     for symbol in &args.symbols {
-        // One request returns at most 1000 candles, under 17 hours.
         let mut page_start = start_ms;
         while page_start < end_ms {
             let klines = format!(

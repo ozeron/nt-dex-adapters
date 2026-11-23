@@ -26,17 +26,12 @@ use nt_dex_aster::{
 use rust_decimal::Decimal;
 use serde::Deserialize;
 
-/// `premiumIndex` joined with `exchangeInfo` for every trading perpetual.
 const PREMIUM_INDEX: &str = include_str!("../test_data/premium_index_all.json");
 
 const TS_INIT: UnixNanos = UnixNanos::new(1_795_375_924_000_000_000);
 const EVENT_TIME_MS: u64 = 1_795_375_923_000;
 const NEXT_FUNDING_MS: u64 = 1_795_392_000_000;
 
-/// The largest price `Price::from_decimal_dp` accepts at precision 8 in this
-/// build: `PRICE_MAX` of `nautilus-model` 0.68.0 with the `high-precision`
-/// feature (`types/price.rs`), checked against the raw `i128` range of
-/// `PRICE_RAW_MAX = PRICE_MAX * 10^16` (`types/fixed.rs`).
 const LARGEST_PRICE: &str = "17014118346046";
 
 #[derive(Debug, Deserialize)]
@@ -78,7 +73,6 @@ fn dec(value: &str) -> Decimal {
     Decimal::from_str(value).unwrap()
 }
 
-/// Mark price as published, for a message with a valid index and funding rate.
 fn mark_of(value: &str) -> Price {
     let parts =
         parse_mark_price_parts(&message(value, "1", "0.0001"), spec("TESTUSDT", 2), TS_INIT)
@@ -151,7 +145,6 @@ fn rounding_to_the_tick_would_lose_more_than_ten_bps_on_some_symbol() {
 
 #[test]
 fn nine_decimals_are_rounded_half_even_and_flagged() {
-    // Exactly half: rounds to the even neighbour.
     let down = parse_mark_price_parts(
         &message("70.123456785", "70.123456775", "0.0001"),
         spec("TESTUSDT", 2),
@@ -190,7 +183,6 @@ fn rounded_flags_are_per_field() {
 
 #[test]
 fn whole_numbers_keep_precision_eight() {
-    // The venue drops the decimals from whole numbers, e.g. `"1666"`.
     let parts = parse_mark_price_parts(
         &message("1666", "1663", "0.0001"),
         spec("YFIUSDT", 3),
@@ -232,7 +224,6 @@ fn largest_price_at_precision_eight_is_17_014_118_346_046() {
 
 #[test]
 fn prices_above_the_limit_fail_only_their_own_field() {
-    // One unit of the eighth decimal, and one whole unit, above the limit.
     for value in ["17014118346046.00000001", "17014118346047"] {
         let parts = parse_mark_price_parts(
             &message(value, "70.71000000", "0.0001"),
@@ -269,7 +260,6 @@ fn unparseable_mark_still_publishes_index_and_funding() {
     assert!(matches!(results[1], Ok(Data::IndexPrice(_))));
     assert!(matches!(results[2], Ok(Data::FundingRate(_))));
 
-    // The all-or-nothing wrapper behaves as before.
     assert!(parse_mark_price(&message, spec("SOLUSDT", 2), TS_INIT).is_err());
 }
 

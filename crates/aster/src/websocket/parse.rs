@@ -17,25 +17,14 @@ use nautilus_model::{
 use super::messages::{AggTrade, BookTicker, DepthUpdate, InlineDepthUpdate, MarkPrice, Trade};
 use crate::common::{self, REFERENCE_PRICE_PRECISION, RawTrade};
 
-/// The identity and precisions needed to parse an instrument's messages.
 #[derive(Clone, Copy, Debug)]
 pub struct InstrumentSpec {
     pub id: InstrumentId,
     pub price_precision: u8,
     pub size_precision: u8,
-    /// Minutes between funding payments, when the venue's `fundingInfo`
-    /// lists the symbol. It varies by symbol: 1, 2, 4, or 8 hours.
     pub funding_interval_mins: Option<u16>,
 }
 
-/// Parses a depth diff into deltas, or `None` when it changes no level.
-///
-/// A zero quantity deletes the level; any other quantity replaces it. The
-/// sequence is the diff's final update id.
-///
-/// # Errors
-///
-/// Returns an error if a level or timestamp does not parse.
 pub fn parse_depth_update(
     update: &DepthUpdate,
     spec: InstrumentSpec,
@@ -110,11 +99,6 @@ fn build_depth_update<'a>(
     Ok(Some(OrderBookDeltas::new(spec.id, deltas)))
 }
 
-/// Parses an aggregate trade.
-///
-/// # Errors
-///
-/// Returns an error if the price, quantity, or timestamp does not parse.
 pub fn parse_agg_trade(
     trade: &AggTrade,
     spec: InstrumentSpec,
@@ -144,12 +128,6 @@ fn trade_tick(
     )
 }
 
-/// Parses an individual trade. Its id is the venue's trade id.
-///
-/// # Errors
-///
-/// Returns an error if the price, quantity, or timestamp does not parse, or
-/// if the size is zero.
 pub fn parse_trade(
     trade: &Trade,
     spec: InstrumentSpec,
@@ -165,11 +143,6 @@ pub fn parse_trade(
     trade_tick(&raw, spec, ts_init)
 }
 
-/// Parses a best bid/ask update.
-///
-/// # Errors
-///
-/// Returns an error if a price, quantity, or timestamp does not parse.
 pub fn parse_book_ticker(
     ticker: &BookTicker,
     spec: InstrumentSpec,
@@ -186,7 +159,6 @@ pub fn parse_book_ticker(
     ))
 }
 
-/// Mark price, index price, and funding rate from one `markPrice` message.
 #[derive(Debug)]
 pub struct MarkPriceData {
     pub mark: MarkPriceUpdate,
@@ -194,21 +166,16 @@ pub struct MarkPriceData {
     pub funding: FundingRateUpdate,
 }
 
-/// The three values of one `markPrice` message, each parsed on its own so a
-/// bad field does not hide the others.
 #[derive(Debug)]
 pub struct MarkPriceParts {
     pub mark: anyhow::Result<MarkPriceUpdate>,
     pub index: anyhow::Result<IndexPriceUpdate>,
     pub funding: anyhow::Result<FundingRateUpdate>,
-    /// The mark price had digits beyond eight decimals and was rounded.
     pub mark_rounded: bool,
-    /// The index price had digits beyond eight decimals and was rounded.
     pub index_rounded: bool,
 }
 
 impl MarkPriceParts {
-    /// The values as data to publish, in mark, index, funding order.
     pub fn into_results(self) -> [anyhow::Result<Data>; 3] {
         [
             self.mark.map(Data::MarkPrice),
@@ -218,18 +185,6 @@ impl MarkPriceParts {
     }
 }
 
-/// Parses a mark price message one field at a time.
-///
-/// Mark and index prices are kept at eight decimals, finer than the
-/// instrument's tick. A value with more digits is rounded half-even, flagged
-/// in the result and logged at warn: the flag is testable and the log reaches
-/// callers that ignore it, while the parser stays free of clocks and sockets.
-///
-/// # Errors
-///
-/// Returns an error only if the event time overflows, since all three values
-/// carry it. A price, rate, or next funding time that does not parse fails
-/// just its own field.
 pub fn parse_mark_price_parts(
     message: &MarkPrice,
     spec: InstrumentSpec,
@@ -275,14 +230,6 @@ pub fn parse_mark_price_parts(
     })
 }
 
-/// Parses a mark price message.
-///
-/// See [`parse_mark_price_parts`] for the precision rule. This fails when any
-/// one field does.
-///
-/// # Errors
-///
-/// Returns an error if a price, rate, or timestamp does not parse.
 pub fn parse_mark_price(
     message: &MarkPrice,
     spec: InstrumentSpec,

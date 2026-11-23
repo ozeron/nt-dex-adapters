@@ -99,7 +99,6 @@ async fn forward(
     fault: &mut watch::Receiver<Fault>,
     counters: &Counters,
 ) -> Result<bool> {
-    // A cut belongs to the socket that was active when the directive arrived.
     fault.borrow_and_update();
     let url = format!("{WS_URL}/stream");
     let (mut upstream, _) = timeout(Duration::from_secs(8), connect_async(url)).await??;
@@ -110,7 +109,6 @@ async fn forward(
             changed = fault.changed() => {
                 changed.context("relay controller exited")?;
                 if *fault.borrow_and_update() == Fault::Cut {
-                    // Drop both sockets without a WebSocket close handshake.
                     return Ok(true);
                 }
             }
@@ -138,8 +136,6 @@ async fn forward(
     }
 }
 
-// Keep heartbeats and control replies flowing. Discarding depth frames creates a
-// real discontinuity when depth delivery resumes, without waiting for venue timeouts.
 fn withhold_depth(text: &str, counters: &Counters) -> Result<bool> {
     let envelope: Envelope<'_> = serde_json::from_str(text)?;
     let Some(symbol) = envelope

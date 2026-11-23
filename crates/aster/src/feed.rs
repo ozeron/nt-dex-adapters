@@ -28,17 +28,13 @@ use crate::{
     },
 };
 
-/// Something the feed produced while handling an input.
 #[derive(Debug)]
 #[expect(
     clippy::large_enum_variant,
     reason = "data is the common case; boxing it would allocate per event"
 )]
 pub enum FeedEvent {
-    /// Data to publish.
     Data(Data),
-    /// The book for this venue symbol needs a REST depth snapshot, to be
-    /// passed to [`AsterFeed::handle_depth_snapshot`].
     SnapshotRequired(Ustr),
 }
 
@@ -46,15 +42,8 @@ pub enum FeedEvent {
 struct Market {
     spec: InstrumentSpec,
     book: BookSync<DepthPayload>,
-    /// The latest `ts_init` given to this book's deltas. A snapshot is
-    /// stamped when it is applied, which can be after a newer diff left the
-    /// socket; later deltas are held to it so the book replays in order.
     book_ts_floor: UnixNanos,
-    /// The last individual trade published. The venue numbers them
-    /// consecutively per symbol.
     last_trade_id: Option<u64>,
-    /// The last aggregate trade published, from the separate aggregate id
-    /// space. Only old captures carry these.
     last_agg_trade_id: Option<u64>,
 }
 
@@ -99,10 +88,6 @@ impl Default for BookBufferLimits {
     }
 }
 
-/// Checks a trade id against the last one published for its symbol and
-/// records it. Returns `false` for a trade already published, for instance
-/// by a stream that was briefly open on two connections. An id that skips
-/// ahead is logged and added to `missed`, as happens across a reconnect.
 fn track_trade_id(
     last: &mut Option<u64>,
     id: u64,
@@ -132,7 +117,6 @@ fn market<'a>(
         .with_context(|| format!("no instrument loaded for symbol {raw_symbol}"))
 }
 
-/// Parses market-stream frames and keeps each book in sequence.
 #[derive(Debug, Default)]
 pub struct AsterFeed {
     markets: AHashMap<Ustr, Market>,
@@ -143,7 +127,6 @@ pub struct AsterFeed {
 }
 
 impl AsterFeed {
-    /// Creates a feed that knows the given instruments.
     #[must_use]
     pub fn new(instruments: &[InstrumentAny]) -> Self {
         let mut feed = Self::default();
@@ -162,7 +145,6 @@ impl AsterFeed {
         self.buffered_depth_bytes
     }
 
-    /// Registers an instrument, keeping existing book state if it is known.
     pub fn add_instrument(&mut self, instrument: &InstrumentAny) {
         let spec = InstrumentSpec {
             id: instrument.id(),
@@ -185,8 +167,6 @@ impl AsterFeed {
             });
     }
 
-    /// Replaces every instrument's funding interval with the venue's current
-    /// list. A symbol the list no longer has loses its interval.
     pub fn replace_funding_intervals(&mut self, intervals: &[(String, u16)]) {
         for market in self.markets.values_mut() {
             market.spec.funding_interval_mins = None;
@@ -194,8 +174,6 @@ impl AsterFeed {
         self.set_funding_intervals(intervals);
     }
 
-    /// Sets the minutes between funding payments for the listed venue
-    /// symbols, as parsed from `fundingInfo`. Unknown symbols are ignored.
     pub fn set_funding_intervals(&mut self, intervals: &[(String, u16)]) {
         for (symbol, minutes) in intervals {
             if let Some(symbol) = Ustr::from_existing(symbol)
@@ -206,14 +184,11 @@ impl AsterFeed {
         }
     }
 
-    /// Trades known to be missing: the venue's ids skipped ahead, as they do
-    /// across a reconnect. Counts individual and aggregate trades together.
     #[must_use]
     pub const fn missed_trades(&self) -> u64 {
         self.missed_trades
     }
 
-    /// Returns the instrument id for a venue symbol, if it is known.
     #[must_use]
     pub fn instrument_id(&self, raw_symbol: &str) -> Option<InstrumentId> {
         Ustr::from_existing(raw_symbol)
@@ -221,7 +196,6 @@ impl AsterFeed {
             .map(|market| market.spec.id)
     }
 
-    /// Returns `true` when the symbol's book is in sequence.
     #[must_use]
     pub fn is_book_live(&self, raw_symbol: &str) -> bool {
         Ustr::from_existing(raw_symbol)
@@ -229,8 +203,6 @@ impl AsterFeed {
             .is_some_and(|market| market.book.is_live())
     }
 
-    /// Venue symbols whose book lost sequence and is still waiting for a
-    /// snapshot. Their last published state is stale.
     #[must_use]
     pub fn books_awaiting_snapshot(&self) -> Vec<Ustr> {
         let mut symbols: Vec<Ustr> = self
@@ -243,8 +215,6 @@ impl AsterFeed {
         symbols
     }
 
-    /// Forgets all book progress, as after a reconnect. Each book requests a
-    /// fresh snapshot on its next diff.
     pub fn reset_books(&mut self) {
         for market in self.markets.values_mut() {
             market.book.reset();
@@ -252,7 +222,6 @@ impl AsterFeed {
         self.buffered_depth_bytes = 0;
     }
 
-    /// Forgets one book's progress, as when its subscription is dropped.
     pub fn reset_book(&mut self, raw_symbol: &str) {
         if let Some(symbol) = Ustr::from_existing(raw_symbol)
             && let Some(market) = self.markets.get_mut(&symbol)
@@ -273,8 +242,6 @@ impl AsterFeed {
     ) -> anyhow::Result<()> {
         for payload in self.deltas.drain(..) {
             if let Some(mut deltas) = payload.into_deltas()? {
-                // Buffered diffs enter the catalog with the snapshot. Their
-                // receive timestamp cannot precede the snapshot in replay.
                 if let Some(floor) = ts_floor
                     && deltas.ts_init < floor
                 {
@@ -320,7 +287,6 @@ impl AsterFeed {
             validate_inline_depth_update(&update, market.spec)?;
             if !update.bids.is_empty() || !update.asks.is_empty() {
                 bytes = payload.len();
-                // An oversized diff advances the eviction watermark without copying its payload.
                 if BookSync::<DepthPayload>::payload_fits(bytes, budget) {
                     diff.deltas = Some(DepthPayload::Wire {
                         payload: payload.into(),
@@ -340,14 +306,6 @@ impl AsterFeed {
         self.drain_deltas(action, update.symbol, None, out)
     }
 
-    /// Handles one text frame from the combined stream.
-    ///
-    /// Control replies and streams the adapter does not consume are ignored.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the frame is malformed or names an unknown
-    /// symbol. The feed stays usable: one bad frame does not poison it.
     pub fn handle_text(
         &mut self,
         text: &str,
@@ -411,7 +369,6 @@ impl AsterFeed {
                 let message: MarkPrice =
                     serde_json::from_str(payload).context("invalid markPrice")?;
                 let spec = market(&mut self.markets, message.symbol)?.spec;
-                // One bad field does not cost the other two.
                 let parts = parse_mark_price_parts(&message, spec, ts_init)?;
                 for result in parts.into_results() {
                     match result {
@@ -430,11 +387,6 @@ impl AsterFeed {
         Ok(())
     }
 
-    /// Handles a REST depth snapshot body for a venue symbol.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the symbol is unknown or the body does not parse.
     pub fn handle_depth_snapshot(
         &mut self,
         raw_symbol: &str,
@@ -466,7 +418,6 @@ impl AsterFeed {
     }
 }
 
-/// Returns the venue symbol for an instrument id, as used in stream names.
 #[must_use]
 pub fn stream_symbol(instrument_id: &InstrumentId) -> String {
     common::raw_symbol(instrument_id).to_lowercase()

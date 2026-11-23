@@ -21,8 +21,6 @@ struct Diff {
     payload: Option<u64>,
 }
 
-/// Reference book with a two-update retained suffix. It derives snapshot
-/// validity from the retained ranges and consumes only their contiguous prefix.
 #[derive(Default)]
 struct Reference {
     pending: Option<Vec<Diff>>,

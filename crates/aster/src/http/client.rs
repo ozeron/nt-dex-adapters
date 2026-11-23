@@ -7,7 +7,6 @@ use nautilus_network::http::{HttpClient, HttpResponse};
 use super::parse::{ParsedInstruments, parse_exchange_info, parse_funding_intervals};
 use crate::book::recovery::SnapshotError;
 
-/// Fetches public market data over REST.
 #[derive(Clone, Debug)]
 pub struct AsterHttpClient {
     base_url: String,
@@ -15,11 +14,6 @@ pub struct AsterHttpClient {
 }
 
 impl AsterHttpClient {
-    /// Creates a client for `base_url`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the HTTP transport cannot be built.
     pub fn new(base_url: &str, timeout_secs: u64) -> anyhow::Result<Self> {
         let inner = HttpClient::builder()
             .timeout_secs(timeout_secs)
@@ -50,11 +44,6 @@ impl AsterHttpClient {
         Ok(body.into_owned())
     }
 
-    /// Fetches and parses all instrument definitions.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the request fails or the body is not valid.
     pub async fn request_instruments(
         &self,
         ts_init: UnixNanos,
@@ -63,21 +52,10 @@ impl AsterHttpClient {
         parse_exchange_info(&body, ts_init)
     }
 
-    /// Fetches minutes between funding payments, by venue symbol.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the request fails or the body is not valid.
     pub async fn request_funding_intervals(&self) -> anyhow::Result<Vec<(String, u16)>> {
         parse_funding_intervals(&self.get("/fapi/v1/fundingInfo").await?)
     }
 
-    /// Fetches a raw page of settled funding rates for a venue symbol,
-    /// oldest first. Without `start_ms` the venue returns the latest rows.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the request fails.
     pub async fn request_funding_rates(
         &self,
         raw_symbol: &str,
@@ -91,12 +69,6 @@ impl AsterHttpClient {
         self.get(&path).await
     }
 
-    /// Fetches the raw body of the most recent individual trades for a venue
-    /// symbol, oldest first. The venue allows at most 1000.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the request fails.
     pub async fn request_trades(&self, raw_symbol: &str, limit: usize) -> anyhow::Result<String> {
         self.get(&format!(
             "/fapi/v1/trades?symbol={raw_symbol}&limit={limit}"
@@ -104,11 +76,6 @@ impl AsterHttpClient {
         .await
     }
 
-    /// Fetches a raw depth snapshot body for a venue symbol.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the request fails.
     pub async fn request_depth(&self, raw_symbol: &str, limit: u16) -> anyhow::Result<String> {
         self.get(&depth_path(raw_symbol, limit)).await
     }

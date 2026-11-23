@@ -59,7 +59,6 @@ fn millis(value: u64) -> UnixNanos {
     UnixNanos::from(value * 1_000_000)
 }
 
-/// Feeds one frame and returns the data it produced.
 fn data(feed: &mut AsterFeed, frame: &str) -> Vec<Data> {
     let mut events = Vec::new();
     feed.handle_text(frame, TS_INIT, &mut events).unwrap();
@@ -96,7 +95,6 @@ fn exchange_info_loads_trading_perpetuals_only() {
 
 #[test]
 fn instrument_uses_venue_precision_with_padded_tick() {
-    // SOLUSDT: pricePrecision 4 with tickSize "0.0100".
     let sol = instrument("SOLUSDT");
     assert_eq!(sol.id().to_string(), SOL);
     assert_eq!(sol.price_precision(), 4);
@@ -109,7 +107,6 @@ fn instrument_uses_venue_precision_with_padded_tick() {
 
 #[test]
 fn instrument_rescales_tick_coarser_than_precision() {
-    // YFIUSDT: tickSize "1" at pricePrecision 3, stepSize "0.0010" at 4.
     let yfi = instrument("YFIUSDT");
     assert_eq!(yfi.price_precision(), 3);
     assert_eq!(yfi.price_increment(), Price::from("1.000"));
@@ -139,21 +136,18 @@ fn agg_trade_becomes_trade_tick() {
     assert_eq!(trade.instrument_id.to_string(), SOL);
     assert_eq!(trade.price, Price::from("70.7200"));
     assert_eq!(trade.size, Quantity::from("62.34"));
-    // "m": false means the buyer was the taker.
     assert_eq!(trade.aggressor_side, AggressorSide::Buy);
     assert_eq!(trade.trade_id.to_string(), "30717079");
     assert_eq!(trade.ts_event, millis(1_795_345_469_900));
     assert_eq!(trade.ts_init, TS_INIT);
 }
 
-/// The `ws_trade.json` frame with another trade id.
 fn trade_frame(id: u64) -> String {
     let frame = WS_TRADE.replace("150490341", &id.to_string());
     assert!(frame.contains(&format!(r#""t":{id}"#)), "fixture changed");
     frame
 }
 
-/// The trade ids of the trades a feed publishes for frames, in order.
 fn trade_ids(feed: &mut AsterFeed, frames: &[String]) -> Vec<String> {
     frames
         .iter()
@@ -174,11 +168,8 @@ fn trade_becomes_trade_tick() {
     assert_eq!(trade.instrument_id.to_string(), BTC);
     assert_eq!(trade.price, Price::from("60757.6"));
     assert_eq!(trade.size, Quantity::from("0.045"));
-    // "m": true means the buyer was the maker, so the aggressor sold.
     assert_eq!(trade.aggressor_side, AggressorSide::Sell);
-    // The venue trade id, not an aggregate id.
     assert_eq!(trade.trade_id.to_string(), "150490341");
-    // `T`, the trade time, not `E`, the event time.
     assert_eq!(trade.ts_event, millis(1_795_375_790_450));
     assert_eq!(trade.ts_init, TS_INIT);
 }
@@ -236,7 +227,6 @@ fn repeated_trades_are_dropped() {
         trade_frame(150_490_341),
         trade_frame(150_490_341),
         trade_frame(150_490_342),
-        // Already published: an older id must not be published again.
         trade_frame(150_490_341),
         trade_frame(150_490_342),
         trade_frame(150_490_343),
@@ -268,9 +258,6 @@ fn a_jump_in_trade_ids_is_counted_as_missed() {
 #[test]
 fn trade_and_aggregate_ids_are_tracked_separately() {
     let mut feed = AsterFeed::new(&instruments());
-    // The aggregate id space is far from the trade id space: if the two were
-    // compared, the lower ids would be dropped as repeats or the higher ones
-    // counted as gaps.
     let agg = WS_AGG_TRADE.to_owned();
     let trade = WS_TRADE
         .replace("BTCUSDT", "SOLUSDT")
@@ -354,13 +341,11 @@ fn depth_waits_for_snapshot_then_book_goes_live() {
     let mut feed = AsterFeed::new(&instruments());
     let mut events = Vec::new();
 
-    // The first diff is held and a snapshot is requested.
     feed.handle_text(WS_DEPTH, TS_INIT, &mut events).unwrap();
     assert!(matches!(&events[..], [FeedEvent::SnapshotRequired(symbol)] if symbol == "SOLUSDT"));
     assert!(!feed.is_book_live("SOLUSDT"));
     events.clear();
 
-    // The snapshot is newer than the held diff, which is dropped.
     feed.handle_depth_snapshot("SOLUSDT", DEPTH_SNAPSHOT, TS_INIT, &mut events)
         .unwrap();
     let [FeedEvent::Data(Data::BookDeltas(snapshot))] = &events[..] else {
@@ -400,7 +385,6 @@ fn depth_diff_after_snapshot_updates_and_deletes() {
     let mut feed = AsterFeed::new(&instruments());
     let mut events = Vec::new();
     feed.handle_text(WS_DEPTH, TS_INIT, &mut events).unwrap();
-    // A snapshot inside the diff's update-id range, so the diff applies.
     let snapshot = DEPTH_SNAPSHOT.replace("668462586092", "668462549000");
     events.clear();
     feed.handle_depth_snapshot("SOLUSDT", &snapshot, TS_INIT, &mut events)
@@ -428,7 +412,6 @@ fn depth_diff_after_snapshot_updates_and_deletes() {
     assert_eq!(bid.order.price, Price::from("70.6900"));
     assert_eq!(bid.order.size, Quantity::from("5015.22"));
 
-    // ["76.7800", "0.00"] removes the level.
     let removed = &diff.deltas[2];
     assert_eq!(
         (removed.action, removed.order.side),
@@ -463,7 +446,6 @@ fn bad_frames_are_errors_and_do_not_poison_the_feed() {
     assert!(feed.handle_text(&bad_price, TS_INIT, &mut events).is_err());
     assert!(events.is_empty());
 
-    // A zero size would panic inside `TradeTick::new`.
     let zero_size = WS_AGG_TRADE.replace("62.34", "0.00");
     let error = feed
         .handle_text(&zero_size, TS_INIT, &mut events)
@@ -506,7 +488,6 @@ fn funding_rate_carries_the_venue_interval() {
     };
     assert_eq!(funding.interval, Some(480));
 
-    // Reloading the instrument keeps the interval.
     feed.add_instrument(&instrument("SOLUSDT"));
     let reloaded = data(&mut feed, WS_MARK_PRICE);
     let Some(Data::FundingRate(funding)) = reloaded.last() else {
@@ -525,7 +506,6 @@ fn cache(instruments: &[InstrumentAny]) -> AHashMap<InstrumentId, InstrumentAny>
 #[test]
 fn reloading_the_same_instruments_changes_nothing() {
     let cached = cache(&instruments());
-    // A later load differs only in its timestamps.
     let later = parse_exchange_info(EXCHANGE_INFO, millis(1_795_400_000_000))
         .unwrap()
         .instruments;
@@ -538,8 +518,6 @@ fn instrument_diff_reports_added_changed_and_removed() {
     let sol = InstrumentId::from(SOL);
     let btc = InstrumentId::from("BTCUSDT-PERP.ASTER");
 
-    // The venue halves SOL's minimum quantity step and delists BTC, and
-    // lists a symbol the cache has not seen.
     let mut info: serde_json::Value = serde_json::from_str(EXCHANGE_INFO).unwrap();
     let symbols = info["symbols"].as_array_mut().unwrap();
     symbols.retain(|symbol| symbol["symbol"] != "BTCUSDT");
@@ -576,8 +554,6 @@ fn instrument_diff_reports_added_changed_and_removed() {
 fn a_book_level_finer_than_the_instrument_is_refused_not_rounded() {
     let mut feed = AsterFeed::new(&instruments());
     let mut events = Vec::new();
-    // SOL sizes have two decimals. Rounding 0.004 would give zero, and a
-    // zero quantity deletes the level.
     let frame = WS_DEPTH.replacen("\"5015.22\"", "\"0.004\"", 1);
     assert_ne!(frame, WS_DEPTH, "fixture no longer has the expected level");
     let error = feed.handle_text(&frame, TS_INIT, &mut events).unwrap_err();
@@ -589,7 +565,6 @@ fn a_book_level_finer_than_the_instrument_is_refused_not_rounded() {
 fn funding_intervals_are_replaced_not_merged() {
     let mut feed = AsterFeed::new(&instruments());
     feed.set_funding_intervals(&parse_funding_intervals(FUNDING_INFO).unwrap());
-    // The venue's next list has no SOL entry.
     feed.replace_funding_intervals(&[("BTCUSDT".to_owned(), 60)]);
     let events = data(&mut feed, WS_MARK_PRICE);
     let Some(Data::FundingRate(funding)) = events.last() else {

@@ -64,7 +64,6 @@ fn import_capture(capture: &str, catalog_dir: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Per-instrument event counts and the time range they cover.
 #[derive(Default)]
 struct Tally {
     deltas: usize,
@@ -84,8 +83,6 @@ impl Tally {
     }
 }
 
-/// Rebuilds every book from the recorded deltas and counts the completed
-/// updates that leave it crossed.
 fn crossed_books(deltas: &[OrderBookDelta]) -> anyhow::Result<BTreeMap<InstrumentId, usize>> {
     let mut books: BTreeMap<InstrumentId, OrderBook> = BTreeMap::new();
     let mut crossed: BTreeMap<InstrumentId, usize> = BTreeMap::new();
@@ -165,9 +162,6 @@ fn summary(catalog_dir: &str) -> anyhow::Result<()> {
 
     let crossed: usize = crossed_books(&deltas)?.values().sum();
     println!("crossed book states: {crossed}");
-    // Updates must come back in the order the venue issued them, or a
-    // rebuilt book is wrong. A snapshot and the updates applied on top of
-    // it share a receive time, so this also checks that ties keep order.
     let mut last_sequence: BTreeMap<InstrumentId, u64> = BTreeMap::new();
     let mut out_of_order = 0_usize;
     for delta in &deltas {
@@ -200,7 +194,6 @@ fn summary(catalog_dir: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Parses `<catalog-dir> [--minutes N] [--rotate-secs N] SYMBOL...`.
 fn record_options(args: &[&str]) -> anyhow::Result<record::RecordOptions> {
     let mut args = args.iter().copied();
     let catalog_dir = args.next().context(USAGE)?.to_owned();

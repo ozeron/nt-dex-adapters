@@ -83,7 +83,6 @@ pub(crate) fn spawn(
     let guard = owner.cancellation.clone().drop_guard();
     get_runtime().spawn(async move {
         let _guard = guard;
-        // Cold-start books wait their turn outside the shared retry budget.
         let first = tokio::select! {
             biased;
             () = owner.cancellation.cancelled() => return,

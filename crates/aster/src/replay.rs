@@ -18,7 +18,6 @@ use crate::{
     http::parse::{parse_exchange_info, parse_funding_intervals},
 };
 
-/// One line of a capture file.
 #[derive(Debug, Deserialize)]
 struct Record {
     ts_recv_ns: u64,
@@ -27,35 +26,19 @@ struct Record {
     raw: String,
 }
 
-/// What a capture replayed into.
 #[derive(Debug, Default)]
 pub struct Replay {
-    /// Every instrument in the captured `exchangeInfo`.
     pub instruments: Vec<InstrumentAny>,
-    /// Market data in emission order, with non-decreasing `ts_init`.
     pub data: Vec<Data>,
-    /// Frames the feed rejected, as `line number: reason`.
     pub rejected: Vec<String>,
-    /// Symbols whose book was out of sequence when the capture ended, with
-    /// no snapshot left to recover from. Their deltas stop at the gap.
     pub unsynced_books: Vec<String>,
 }
 
-/// Returns the `symbol` query parameter of a captured REST path.
 fn query_symbol(source: &str) -> Option<&str> {
     let (_, query) = source.split_once("symbol=")?;
     query.split('&').next()
 }
 
-/// Replays a capture, returning its instruments and market data.
-///
-/// The receive timestamps in the file become `ts_init`.
-///
-/// # Errors
-///
-/// Returns an error if a line is not a capture record, or if the
-/// `exchangeInfo` or a depth snapshot the feed needs does not parse.
-/// Individual stream frames that fail are listed in [`Replay::rejected`].
 pub fn replay_capture(reader: impl BufRead) -> anyhow::Result<Replay> {
     let mut replay = Replay::default();
     let mut feed = AsterFeed::default();
@@ -68,7 +51,6 @@ pub fn replay_capture(reader: impl BufRead) -> anyhow::Result<Replay> {
         let line_number = index.saturating_add(1);
         let record: Record = serde_json::from_str(&line?)
             .with_context(|| format!("line {line_number} is not a capture record"))?;
-        // REST records are stamped on arrival but written slightly later.
         clock = clock.max(UnixNanos::from(record.ts_recv_ns));
 
         match (record.kind.as_str(), record.source.as_str()) {

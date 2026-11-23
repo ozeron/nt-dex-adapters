@@ -8,14 +8,10 @@ use nautilus_model::{
 };
 use rust_decimal::Decimal;
 
-/// The difference between the cached instruments and a fresh load.
 #[derive(Debug, Default)]
 pub struct InstrumentChanges {
-    /// Instruments that were not known before.
     pub added: Vec<InstrumentAny>,
-    /// Known instruments whose definition differs.
     pub changed: Vec<InstrumentAny>,
-    /// Instruments no longer listed as trading perpetuals.
     pub removed: Vec<InstrumentId>,
 }
 
@@ -26,7 +22,6 @@ impl InstrumentChanges {
     }
 }
 
-/// The definition fields that affect consumers. Load timestamps differ on every load.
 #[derive(PartialEq)]
 struct InstrumentDefinition {
     base_currency: Option<Currency>,
@@ -66,7 +61,6 @@ impl From<&InstrumentAny> for InstrumentDefinition {
     }
 }
 
-/// Compares the cached instruments with a fresh load.
 #[must_use]
 pub fn diff_instruments(
     cached: &AHashMap<InstrumentId, InstrumentAny>,

@@ -14,3 +14,5 @@ Build one public market-data adapter at a time. Start with Aster and hand-review
 Use `common`, `http`, `websocket`, `parse.rs`, `config.rs`, `data.rs`, and `factories.rs` as the adapter grows. Compare Aster behavior with the public docs and captures before reusing Binance futures parsing or synchronization. Use Lighter as a reference for NautilusTrader's client interfaces.
 
 Keep `nautilus-*` pins in the root manifest. Verify an upgrade across the adapter crates and node together.
+
+Keep Rust comments in the leading file header. Use `//!` for file documentation. `scripts/gate.sh` checks this rule before Clippy.

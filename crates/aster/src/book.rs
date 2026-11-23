@@ -12,27 +12,19 @@ pub(crate) mod recovery;
 #[cfg(test)]
 mod model;
 
-/// A depth diff with the IDs needed to sequence it.
 #[derive(Debug)]
 pub struct DepthDiff<T = OrderBookDeltas> {
-    /// The last update ID covered by this diff.
     pub final_update_id: u64,
-    /// The last update ID covered by its predecessor.
     pub prev_final_update_id: u64,
-    /// The payload, or none when the diff has no level changes.
     pub deltas: Option<T>,
 }
 
-/// What the caller must do after handing the book an update.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
-    /// No snapshot request is needed.
     None,
-    /// Fetch another REST snapshot.
     RequestSnapshot,
 }
 
-/// Also cap the number of diffs, including empty sequence updates.
 const MAX_BUFFERED: usize = 20_000;
 
 #[derive(Debug)]
@@ -94,8 +86,6 @@ impl<T> Pending<T> {
             self.evict(old.final_update_id);
         }
         if !can_fit {
-            // Require the snapshot to cover this update even if the
-            // retained suffix is empty.
             self.diffs = VecDeque::new();
             self.evict(diff.final_update_id);
             return;
@@ -115,7 +105,6 @@ enum State<T> {
     Live { last_update_id: u64, linked: bool },
 }
 
-/// Orders depth diffs around REST snapshots and detects gaps.
 #[derive(Debug)]
 pub struct BookSync<T = OrderBookDeltas> {
     state: State<T>,
@@ -146,19 +135,16 @@ impl<T> BookSync<T> {
         Self { state: State::Idle }
     }
 
-    /// Returns true while a book has work pending from a snapshot request.
     #[must_use]
     pub fn is_awaiting_snapshot(&self) -> bool {
         matches!(self.state, State::Buffering(_))
     }
 
-    /// Returns true once a snapshot has been applied and no gap is pending.
     #[must_use]
     pub fn is_live(&self) -> bool {
         matches!(self.state, State::Live { .. })
     }
 
-    /// Drops all progress. The next diff requests a new snapshot.
     pub fn reset(&mut self) {
         *self = Self::empty();
     }
@@ -194,15 +180,12 @@ impl<T> BookSync<T> {
         } else if diff.final_update_id <= last_update_id {
             Verdict::Stale
         } else if diff.prev_final_update_id <= last_update_id {
-            // Quantities are absolute, so a diff overlapping the snapshot
-            // can be applied whole.
             Verdict::Apply
         } else {
             Verdict::Gap
         }
     }
 
-    /// Handles a diff from the stream, pushing deltas to emit onto the output.
     pub fn on_diff(&mut self, diff: DepthDiff<T>, out: &mut Vec<T>) -> Action {
         self.on_diff_with_budget(diff, 0, usize::MAX, out)
     }
@@ -241,8 +224,6 @@ impl<T> BookSync<T> {
         Action::RequestSnapshot
     }
 
-    /// Handles a REST snapshot, pushing it and the contiguous diffs following
-    /// it onto the output. A snapshot that predates the buffer is retried.
     pub fn on_snapshot(&mut self, last_update_id: u64, snapshot: T, out: &mut Vec<T>) -> Action {
         let State::Buffering(pending) = &mut self.state else {
             return Action::None;
@@ -278,7 +259,6 @@ impl<T> BookSync<T> {
                     out.extend(diff.deltas);
                 }
                 Verdict::Gap => {
-                    // Preserve the first unlinked diff and everything after it.
                     pending.bytes = pending.bytes.saturating_add(bytes);
                     pending.diffs.push_front((diff, bytes));
                     pending.trim_storage();
@@ -389,7 +369,6 @@ mod tests {
         for (prev, last) in [(1, 5), (5, 9), (9, 12)] {
             book.on_diff(diff(prev, last), &mut out);
         }
-        // The snapshot lies inside the second diff.
         assert_eq!(book.on_snapshot(7, deltas(7), &mut out), Action::None);
         assert_eq!(sequences(&out), [7, 9, 12]);
         assert!(book.is_live());
@@ -399,7 +378,6 @@ mod tests {
     fn snapshot_between_two_diffs_bridges_on_pu() {
         let mut book = BookSync::new();
         let mut out = Vec::new();
-        // Update ids are venue-global, so 6 belongs to another symbol.
         book.on_diff(diff(1, 5), &mut out);
         book.on_diff(diff(5, 9), &mut out);
         assert_eq!(book.on_snapshot(6, deltas(6), &mut out), Action::None);
@@ -418,7 +396,6 @@ mod tests {
         assert_eq!(sequences(&out), Vec::<u64>::new());
         assert!(!book.is_live());
 
-        // The buffered diff survives for the next snapshot.
         assert_eq!(book.on_snapshot(12, deltas(12), &mut out), Action::None);
         assert_eq!(sequences(&out), [12, 15]);
     }
@@ -491,7 +468,6 @@ mod tests {
     fn gap_inside_the_buffer_keeps_the_diffs_after_it() {
         let mut book = BookSync::new();
         let mut out = Vec::new();
-        // 105 follows the snapshot, then 110 -> 115 is missing.
         for (prev, last) in [(95, 105), (110, 115), (115, 120)] {
             book.on_diff(diff(prev, last), &mut out);
         }
@@ -513,7 +489,6 @@ mod tests {
         let mut out = Vec::new();
         book.on_diff(diff(1, 5), &mut out);
         book.reset();
-        // The answer to the request made before the reset.
         assert_eq!(book.on_snapshot(5, deltas(5), &mut out), Action::None);
         assert_eq!(sequences(&out), Vec::<u64>::new());
         assert!(!book.is_live());

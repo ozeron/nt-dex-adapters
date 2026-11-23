@@ -4,6 +4,7 @@ members = [
     "crates/aster",
     "bins/node",
     "tools/capture",
+    "tools/rust-comments",
 ]
 # Bare `cargo check` / `cargo test` touch only the venue under development.
 # Use `--workspace` (or `scripts/gate.sh`) to include the node.
@@ -43,6 +44,7 @@ all = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 # Pedantic opt-outs
 must_use_candidate = "allow"
+missing_errors_doc = "allow"
 # No panics on venue input: a bad frame must become an error, not a crash.
 unwrap_used = "warn"
 expect_used = "warn"
