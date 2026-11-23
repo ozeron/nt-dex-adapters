@@ -16,6 +16,8 @@ pub struct AsterDataClientConfig {
     pub http_timeout_secs: u64,
     /// Levels per side requested for book snapshots (5 to 1000).
     pub book_snapshot_depth: u16,
+    /// Snapshot deadline after rate admission. Zero disables the per-snapshot deadline.
+    pub book_snapshot_timeout_secs: u64,
     /// Pending depth payload and diff storage budget for one book, in bytes.
     pub book_buffer_bytes: usize,
     /// Pending depth payload and diff storage budget across the session, in bytes.
@@ -41,6 +43,7 @@ impl Default for AsterDataClientConfig {
             base_url_ws: WS_URL.to_owned(),
             http_timeout_secs: 20,
             book_snapshot_depth: 1000,
+            book_snapshot_timeout_secs: nautilus_live::book::DEFAULT_BOOK_SNAPSHOT_TIMEOUT_SECS,
             book_buffer_bytes: BOOK_BUFFER_BYTES,
             session_book_buffer_bytes: SESSION_BOOK_BUFFER_BYTES,
             instrument_refresh_interval_secs: 3600,
