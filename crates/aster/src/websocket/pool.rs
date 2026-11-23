@@ -31,28 +31,13 @@ use serde_json::json;
 use tokio::sync::mpsc::UnboundedSender;
 use ustr::Ustr;
 
-/// Rate-limit key for `SUBSCRIBE` and `UNSUBSCRIBE` messages.
 const CONTROL_KEY: &str = "control";
-/// One control message per 300 ms on each connection, as the Binance client
-/// does. The venue allows 10 incoming messages a second.
 const CONTROL_PERIOD: Duration = Duration::from_millis(300);
-/// Most bytes of stream names in one control message.
-///
-/// The venue closes the connection with code 3001 "illegal request" when a
-/// message passes about 4096 bytes: 165 depth streams in one `SUBSCRIBE` are
-/// accepted and 170 are not. The Binance client sends a connection's 200
-/// streams in one message, which this venue refuses.
 const CONTROL_MESSAGE_BYTES: usize = 3_000;
-/// Seconds between keepalive pings, as in the Binance client.
 const HEARTBEAT_SECS: u64 = 20;
 
-/// A frame, the connection it arrived on, and when it arrived.
-///
-/// The time is taken as the frame leaves the socket, so a busy consumer does
-/// not make data look later than it was.
 pub(crate) type PoolFrame = (usize, UnixNanos, Message);
 
-/// A reply to a control message: `{"result":null,"id":1}` on success.
 #[derive(Deserialize)]
 struct ControlReply {
     id: Option<u64>,
@@ -68,9 +53,7 @@ struct Slot {
 
 #[derive(Debug, Default)]
 struct ReconnectEpoch {
-    /// Advanced in the socket callback before the marker enters the frame queue.
     received: Arc<AtomicU64>,
-    /// Advanced on the session task as it processes each reconnect marker.
     consumed: u64,
 }
 
@@ -99,7 +82,6 @@ impl ReconnectFence {
     }
 }
 
-/// Splits `streams` into runs that each fit one control message.
 fn control_chunks(streams: &[String]) -> Vec<&[String]> {
     let mut chunks = Vec::new();
     let mut rest = streams;
@@ -107,7 +89,6 @@ fn control_chunks(streams: &[String]) -> Vec<&[String]> {
         let mut bytes = 0_usize;
         let mut count = 0_usize;
         for stream in rest {
-            // Quotes and a comma around each name.
             bytes = bytes.saturating_add(stream.len()).saturating_add(3);
             if count > 0 && bytes > CONTROL_MESSAGE_BYTES {
                 break;
@@ -131,8 +112,6 @@ pub(crate) struct StreamPool {
     clock: &'static AtomicTime,
     control_key: [Ustr; 1],
     next_request_id: u64,
-    /// `SUBSCRIBE` requests the venue has not answered yet, by request id:
-    /// the connection and the streams asked for.
     pending: AHashMap<u64, (usize, Vec<String>)>,
 }
 
@@ -158,12 +137,10 @@ impl StreamPool {
         }
     }
 
-    /// The most streams the pool can carry.
     pub(crate) const fn capacity(max_streams: usize, max_connections: usize) -> usize {
         max_streams.saturating_mul(max_connections)
     }
 
-    /// Snapshots belong to the last socket generation processed by the session.
     pub(crate) fn reconnect_fence(&self, stream: &str) -> Option<ReconnectFence> {
         self.slots
             .iter()
@@ -193,11 +170,6 @@ impl StreamPool {
             .sum()
     }
 
-    /// Opens one more connection.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the connection cannot be established.
     pub(crate) async fn open_connection(&mut self) -> anyhow::Result<()> {
         let index = self.slots.len();
         let frames = self.frames.clone();
@@ -212,7 +184,6 @@ impl StreamPool {
             let received_at = clock.get_time_ns();
             let bytes = message.as_bytes().len();
             frame_bytes.fetch_add(bytes, Ordering::Relaxed);
-            // The receiver only closes when the session has ended.
             if frames.send((index, received_at, message)).is_err() {
                 frame_bytes.fetch_sub(bytes, Ordering::Relaxed);
             }
@@ -258,10 +229,6 @@ impl StreamPool {
         Ok(())
     }
 
-    /// Sends `streams` in as many messages as the venue's size limit needs.
-    ///
-    /// Returns how many streams, from the front, were sent. Fewer than all
-    /// of them means a send failed, which is logged.
     async fn send(&mut self, slot: usize, method: &str, streams: &[String]) -> usize {
         let mut sent = 0_usize;
         for chunk in control_chunks(streams) {
@@ -286,11 +253,6 @@ impl StreamPool {
         sent
     }
 
-    /// Opens `streams`, adding connections as needed.
-    ///
-    /// Returns the streams that could not be opened: a connection could not
-    /// be established, a send failed, or the pool is full. The caller is
-    /// expected to try those again.
     pub(crate) async fn subscribe(&mut self, streams: &[String]) -> Vec<String> {
         let new: Vec<String> = streams
             .iter()
@@ -308,8 +270,6 @@ impl StreamPool {
             }
         }
 
-        // First fit, staged per connection so each gets as few messages as
-        // the size limit allows.
         let mut counts: Vec<usize> = self.slots.iter().map(|slot| slot.streams.len()).collect();
         let mut batches: Vec<Vec<String>> = vec![Vec::new(); self.slots.len()];
         let mut unplaced = Vec::new();
@@ -329,7 +289,6 @@ impl StreamPool {
                 continue;
             }
             let sent = self.send(slot, "SUBSCRIBE", &batch).await;
-            // Only what went out belongs to the connection.
             unplaced.extend(batch.split_off(sent.min(batch.len())));
             if let Some(slot) = self.slots.get_mut(slot) {
                 slot.streams.extend(batch);
@@ -338,7 +297,6 @@ impl StreamPool {
         unplaced
     }
 
-    /// Closes `streams` on whichever connections carry them.
     pub(crate) async fn unsubscribe(&mut self, streams: &[String]) {
         let closing: Vec<(usize, Vec<String>)> = self
             .slots
@@ -353,18 +311,11 @@ impl StreamPool {
             })
             .collect();
         for (slot, closing) in closing {
-            // A send only fails when the connection is down. It then comes
-            // back without these streams, because they are off its list.
             self.send(slot, "UNSUBSCRIBE", &closing).await;
         }
     }
 
-    /// Reopens every stream of a connection that has just reconnected.
-    ///
-    /// Returns the streams the connection carried, and those among them
-    /// that could not be sent again and are no longer assigned to it.
     pub(crate) async fn resubscribe(&mut self, slot: usize) -> (Vec<String>, Vec<String>) {
-        // Requests sent on the old connection will never be answered.
         self.pending.retain(|_, (owner, _)| *owner != slot);
         let streams = self
             .slots
@@ -382,10 +333,6 @@ impl StreamPool {
         (streams, unsent)
     }
 
-    /// Handles a control reply from connection `slot`.
-    ///
-    /// Returns the streams of a `SUBSCRIBE` the venue refused. They are no
-    /// longer assigned to the connection.
     pub(crate) fn on_reply(&mut self, slot: usize, text: &str) -> Vec<String> {
         let Ok(reply) = serde_json::from_str::<ControlReply>(text) else {
             log::warn!("Aster sent an unrecognised control frame: {text}");
@@ -447,7 +394,6 @@ mod tests {
             let request = json!({ "method": "SUBSCRIBE", "params": chunk, "id": u64::MAX });
             assert!(request.to_string().len() < 4_000);
         }
-        // Order is kept.
         assert_eq!(chunks.concat(), streams);
     }
 

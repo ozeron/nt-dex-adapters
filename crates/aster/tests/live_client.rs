@@ -71,20 +71,16 @@ const WS_TRADE: &str = include_str!("../test_data/ws_trade.json");
 const WS_BOOK_TICKER: &str = include_str!("../test_data/ws_book_ticker.json");
 const WS_MARK_PRICE: &str = include_str!("../test_data/ws_mark_price.json");
 
-/// The real venue refuses a message somewhere between 3959 and 4077 bytes.
 const VENUE_MESSAGE_LIMIT: usize = 4_000;
 const TIMEOUT: Duration = Duration::from_secs(10);
 
-/// What the test tells a mock WebSocket connection to do.
 enum Outgoing {
     Text(String),
     Drop,
 }
 
-/// One WebSocket connection the mock accepted.
 struct Connection {
     streams: BTreeSet<String>,
-    /// `None` once the connection has ended.
     out: Option<UnboundedSender<Outgoing>>,
 }
 
@@ -94,13 +90,9 @@ struct State {
     pause_next_snapshot: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
     http_requests: Vec<String>,
     connections: Vec<Connection>,
-    /// Every `SUBSCRIBE` and `UNSUBSCRIBE`: connection, method, streams.
     control: Vec<(usize, String, Vec<String>)>,
-    /// Messages refused for passing the venue's size limit.
     oversized: usize,
-    /// Streams whose next `SUBSCRIBE` is answered with an error.
     refuse_once: BTreeSet<String>,
-    /// Signals that a connection was accepted, then waits before upgrading it.
     pause_next_handshake: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
 }
 
@@ -168,13 +160,11 @@ impl Venue {
             base_url_http: self.http_url.clone(),
             base_url_ws: self.ws_url.clone(),
             instrument_refresh_interval_secs: 0,
-            // No pacing between snapshots.
             snapshot_weight_per_minute: u32::MAX,
             ..Default::default()
         }
     }
 
-    /// Polls until `check` returns a value.
     async fn wait<T>(&self, what: &str, check: impl Fn(&State) -> Option<T>) -> T {
         let deadline = tokio::time::Instant::now() + TIMEOUT;
         loop {
@@ -189,7 +179,6 @@ impl Venue {
         }
     }
 
-    /// Waits until a live connection carries `stream` and returns its index.
     async fn wait_for_stream(&self, stream: &str) -> usize {
         self.wait(stream, |state| {
             state.connections.iter().position(|connection| {
@@ -199,7 +188,6 @@ impl Venue {
         .await
     }
 
-    /// Sends a frame on the connection that carries its stream.
     async fn push(&self, frame: &str) {
         let envelope: serde_json::Value = serde_json::from_str(frame).unwrap();
         let stream = envelope["stream"].as_str().unwrap().to_owned();
@@ -207,7 +195,6 @@ impl Venue {
         self.push_on(index, frame);
     }
 
-    /// Sends a frame on a given connection, whatever it is subscribed to.
     fn push_on(&self, index: usize, frame: &str) {
         let state = self.state.lock().unwrap();
         let out = state.connections[index].out.as_ref().unwrap();
@@ -228,7 +215,6 @@ impl Venue {
         self.state.lock().unwrap().requests(prefix)
     }
 
-    /// Waits until more than `more_than` `exchangeInfo` requests have arrived.
     async fn wait_for_refreshes(&self, what: &str, more_than: usize) {
         self.wait(what, |state| {
             (state.requests("/fapi/v1/exchangeInfo") > more_than).then_some(())
@@ -236,7 +222,6 @@ impl Venue {
         .await;
     }
 
-    /// Waits for an `UNSUBSCRIBE` that `matches` accepts.
     async fn wait_for_unsubscribe(&self, matches: impl Fn(&[String]) -> bool) {
         self.wait("UNSUBSCRIBE", |state| {
             state
@@ -248,8 +233,6 @@ impl Venue {
         .await;
     }
 
-    /// Cuts a connection without a close handshake and waits until it has
-    /// ended.
     async fn drop_connection(&self, index: usize) {
         {
             let state = self.state.lock().unwrap();
@@ -350,7 +333,6 @@ async fn serve_ws(socket: tokio::net::TcpStream, state: Arc<Mutex<State>>) {
             message = source.next() => match message {
                 Some(Ok(Message::Text(text))) => {
                     if text.len() > VENUE_MESSAGE_LIMIT {
-                        // The venue closes with 3001 "illegal request".
                         state.lock().unwrap().oversized += 1;
                         break;
                     }
@@ -382,7 +364,6 @@ async fn serve_ws(socket: tokio::net::TcpStream, state: Arc<Mutex<State>>) {
                         refused
                     };
                     let reply = if refused {
-                        // The word "stream" in a reply value is not a stream key.
                         format!(
                             r#"{{"error":{{"code":2,"msg":"stream"}},"id":{}}}"#,
                             request["id"]
@@ -405,7 +386,6 @@ async fn serve_ws(socket: tokio::net::TcpStream, state: Arc<Mutex<State>>) {
     state.lock().unwrap().connections[index].out = None;
 }
 
-/// A connected client and the events it publishes.
 struct Harness {
     venue: Venue,
     client: AsterDataClient,
@@ -432,7 +412,6 @@ impl Harness {
         }
     }
 
-    /// Receives events until `pick` accepts one.
     async fn next<T>(&mut self, what: &str, pick: impl Fn(&DataEvent) -> Option<T>) -> T {
         let wait = async {
             loop {
@@ -447,7 +426,6 @@ impl Harness {
             .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
     }
 
-    /// Asserts that nothing `pick` accepts arrives for a short while.
     async fn expect_none(&mut self, what: &str, pick: impl Fn(&DataEvent) -> bool) {
         let quiet = Duration::from_millis(300);
         let wait = async {
@@ -527,7 +505,6 @@ impl Harness {
             .unwrap();
     }
 
-    /// Requests recent trades and waits for the response.
     async fn request_trades(
         &mut self,
         instrument_id: InstrumentId,
@@ -575,8 +552,6 @@ fn ids(symbols: &[&str]) -> Vec<InstrumentId> {
     symbols.iter().map(|symbol| instrument_id(symbol)).collect()
 }
 
-/// The trade fixture, rewritten for another symbol and trade id, at a price
-/// and size every test instrument can hold.
 fn trade_frame(symbol: &str, id: u64) -> String {
     WS_TRADE
         .replace("BTCUSDT", symbol)
@@ -631,7 +606,6 @@ fn trade(event: &DataEvent) -> Option<InstrumentId> {
     }
 }
 
-/// Returns `(sequence, is_snapshot)` of a book update.
 fn book(event: &DataEvent) -> Option<(u64, bool)> {
     match event {
         DataEvent::Data(Data::BookDeltas(deltas)) => {
@@ -666,7 +640,6 @@ fn connect_publishes_instruments_and_streams_trades_and_quotes() {
         assert_eq!(traded, instrument_id("SOLUSDT"));
         harness.next("quote", quote).await;
 
-        // Both subscriptions arrived close together, on one connection.
         assert_eq!(harness.venue.live_connections().len(), 1);
         harness.stop().await;
     });
@@ -725,8 +698,6 @@ fn unsubscribed_data_is_not_published() {
         harness.venue.wait_for_unsubscribe(|_| true).await;
         assert!(harness.venue.live_connections()[0].is_empty());
 
-        // A new trade that was already on its way is not published, while
-        // a stream that is still wanted keeps delivering.
         harness.subscribe_quotes(&["SOLUSDT"]);
         harness.venue.wait_for_stream("solusdt@bookTicker").await;
         harness.venue.push_on(0, &trade_frame("SOLUSDT", 101));
@@ -761,7 +732,6 @@ fn funding_subscription_publishes_mark_index_and_funding() {
         harness.venue.push(WS_MARK_PRICE).await;
 
         let mark = harness.next("mark price", mark_price).await;
-        // Eight decimals whatever the instrument's tick: SOL trades at four.
         assert_eq!(mark.value, Price::from("70.71000000"));
         assert_eq!(mark.value.precision, 8);
         let index = harness
@@ -780,7 +750,6 @@ fn funding_subscription_publishes_mark_index_and_funding() {
         assert_eq!(funding.interval, Some(480), "from fundingInfo");
         assert!(funding.next_funding_ns.is_some());
 
-        // A whole-number mark price still has eight decimals.
         let whole = WS_MARK_PRICE.replace(r#""p":"70.71000000""#, r#""p":"71""#);
         assert_ne!(
             whole, WS_MARK_PRICE,
@@ -800,21 +769,16 @@ fn book_syncs_from_a_snapshot_and_resyncs_after_a_gap() {
         let mut harness = Harness::start(|_| {}).await;
         harness.subscribe_book(&["SOLUSDT"]);
 
-        // The first diff makes the client ask for a snapshot. The snapshot
-        // falls inside the diff's range, so the diff applies on top of it.
         harness.venue.state.lock().unwrap().snapshot_update_id = 1_000;
         harness.venue.push(&depth_diff(990, 1_005, 980)).await;
         assert_eq!(harness.next("snapshot", book).await, (1_000, true));
         assert_eq!(harness.next("first diff", book).await, (1_005, false));
         assert_eq!(harness.venue.requests("/fapi/v1/depth"), 1);
 
-        // The next diff continues the sequence.
         harness.venue.push(&depth_diff(1_006, 1_010, 1_005)).await;
         assert_eq!(harness.next("second diff", book).await, (1_010, false));
         assert_eq!(harness.venue.requests("/fapi/v1/depth"), 1);
 
-        // A diff that does not follow the last one is a gap: the book is
-        // rebuilt from a new snapshot.
         harness.venue.state.lock().unwrap().snapshot_update_id = 2_003;
         harness.venue.push(&depth_diff(2_001, 2_005, 2_000)).await;
         assert_eq!(harness.next("resync snapshot", book).await, (2_003, true));
@@ -899,7 +863,6 @@ fn reconnect_resubscribes_and_resyncs_the_book() {
         let first = harness.venue.wait_for_stream("solusdt@trade").await;
         harness.venue.drop_connection(first).await;
 
-        // The client comes back on a new connection with the same streams.
         let second = harness
             .venue
             .wait("resubscription", |state| {
@@ -915,8 +878,6 @@ fn reconnect_resubscribes_and_resyncs_the_book() {
         harness.venue.push(&trade_frame("SOLUSDT", 100)).await;
         harness.next("trade after reconnect", trade).await;
 
-        // Updates were missed while disconnected, so even a diff that would
-        // have continued the old sequence starts from a new snapshot.
         harness.venue.state.lock().unwrap().snapshot_update_id = 1_008;
         harness.venue.push(&depth_diff(1_006, 1_010, 1_005)).await;
         assert_eq!(
@@ -1059,7 +1020,6 @@ fn final_book_unsubscribe_cancels_its_pending_snapshot() {
             })
             .await;
 
-        // A new subscription on the same socket must own an independent recovery.
         harness.venue.state.lock().unwrap().snapshot_update_id = 2_000;
         harness.subscribe_book(&["SOLUSDT"]);
         harness.venue.push(&depth_diff(1_990, 2_005, 1_980)).await;
@@ -1105,20 +1065,16 @@ fn streams_spread_over_connections_at_the_stream_limit() {
         assert_eq!(connections.len(), 3, "two streams each: {connections:?}");
         assert!(connections.iter().all(|streams| streams.len() == 2));
 
-        // Data arrives whichever connection carries the stream.
         for symbol in symbols {
             harness.venue.push(&trade_frame(symbol, 100)).await;
             assert_eq!(harness.next("trade", trade).await, instrument_id(symbol));
         }
 
-        // The pool is full: a seventh stream is refused and nothing is sent.
         let sent = harness.venue.state.lock().unwrap().control.len();
         harness.subscribe_trades(&["XAUUSD1"]);
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(harness.venue.state.lock().unwrap().control.len(), sent);
 
-        // Closing a stream frees its place for another, on the same
-        // connection and without opening a new one.
         harness.unsubscribe_trades(&["BTCUSDT"]);
         let freed = harness
             .venue
@@ -1131,7 +1087,6 @@ fn streams_spread_over_connections_at_the_stream_limit() {
         assert_eq!(index, freed);
         assert_eq!(harness.venue.live_connections().len(), 3);
 
-        // A BTC trade that was already on its way is not published.
         harness.venue.push_on(0, &trade_frame("BTCUSDT", 9_999));
         harness
             .expect_none("trade", |event| {
@@ -1172,7 +1127,6 @@ fn only_the_dropped_connection_is_resubscribed() {
             .await;
         assert_ne!(replacement, sol);
 
-        // The other connection was left alone: one SUBSCRIBE, ever.
         let on_sol = harness
             .venue
             .state
@@ -1198,7 +1152,6 @@ fn refresh_publishes_changed_instruments_and_retires_removed_ones() {
         })
         .await;
 
-        // The venue delists BTC and raises SOL's minimum notional.
         let mut info: serde_json::Value = serde_json::from_str(EXCHANGE_INFO).unwrap();
         let symbols = info["symbols"].as_array_mut().unwrap();
         symbols.retain(|symbol| symbol["symbol"] != "BTCUSDT");
@@ -1212,7 +1165,6 @@ fn refresh_publishes_changed_instruments_and_retires_removed_ones() {
                 }
             }
         }
-        // Skip the instruments published on connect.
         while harness.events.try_recv().is_ok() {}
         harness.venue.state.lock().unwrap().exchange_info = info.to_string();
 
@@ -1223,7 +1175,6 @@ fn refresh_publishes_changed_instruments_and_retires_removed_ones() {
         let changed = harness.next("changed instrument", instrument).await;
         assert_eq!(changed, instrument_id("SOLUSDT"));
 
-        // A later refresh with nothing new publishes nothing.
         let refreshes = harness.venue.requests("/fapi/v1/exchangeInfo");
         harness
             .venue
@@ -1238,7 +1189,6 @@ fn refresh_publishes_changed_instruments_and_retires_removed_ones() {
             })
             .await;
 
-        // A delisted instrument can no longer be subscribed.
         assert!(harness.try_subscribe_trades(&["BTCUSDT"]).is_err());
         harness.stop().await;
     });
@@ -1389,8 +1339,6 @@ fn trade_history_request_returns_recent_trades() {
         let mut harness = Harness::start(|_| {}).await;
         let btc = instrument_id("BTCUSDT");
 
-        // The mock returns its three rows whatever the limit; the client
-        // keeps the newest `limit`.
         let trades = harness.request_trades(btc, (None, None), 2).await;
         assert_eq!(
             trades,
@@ -1406,8 +1354,6 @@ fn trade_history_request_returns_recent_trades() {
             1
         );
 
-        // A window is cut from a full page, and the limit is capped at the
-        // venue's 1000.
         let window = (Some(1_795_375_995_000), Some(1_795_376_010_000));
         let trades = harness.request_trades(btc, window, 5_000).await;
         assert_eq!(trades, [("150490380".to_owned(), 1_795_376_002_400)]);
@@ -1455,8 +1401,6 @@ fn trade_history_request_for_an_unknown_instrument_is_an_error() {
 #[test]
 fn a_full_connection_is_subscribed_within_the_venue_message_limit() {
     run(async {
-        // 250 symbols: more than one connection's 200 streams, and far more
-        // stream names than fit one message.
         let mut info: serde_json::Value = serde_json::from_str(EXCHANGE_INFO).unwrap();
         let template = info["symbols"]
             .as_array()
@@ -1532,8 +1476,6 @@ fn a_refused_subscription_is_tried_again() {
             .insert("solusdt@trade".to_owned());
         harness.subscribe_trades(&["SOLUSDT"]);
 
-        // The venue answers the first request with an error, so nothing is
-        // open until the client asks again.
         harness.venue.wait_for_stream("solusdt@trade").await;
         let requests = harness
             .venue
@@ -1601,8 +1543,6 @@ fn a_definition_that_stops_parsing_is_not_a_delisting() {
             config.instrument_refresh_interval_secs = 1;
         })
         .await;
-        // The venue still lists SOL as trading, with a lot size that does
-        // not parse.
         let mut info: serde_json::Value = serde_json::from_str(EXCHANGE_INFO).unwrap();
         for symbol in info["symbols"].as_array_mut().unwrap() {
             if symbol["symbol"] == "SOLUSDT" {
@@ -1625,7 +1565,6 @@ fn a_definition_that_stops_parsing_is_not_a_delisting() {
                 instrument_status(event).is_some()
             })
             .await;
-        // It can still be subscribed.
         harness.subscribe_trades(&["SOLUSDT"]);
         harness.venue.wait_for_stream("solusdt@trade").await;
         harness.stop().await;
@@ -1642,9 +1581,6 @@ fn a_snapshot_applied_late_does_not_put_the_book_out_of_order() {
         harness.venue.push(&depth_diff(1_006, 1_010, 1_005)).await;
         harness.venue.push(&depth_diff(1_011, 1_015, 1_010)).await;
 
-        // Whatever order the snapshot and the diffs were handled in, the
-        // book comes out in venue order with receive times that never go
-        // back, which is the order a catalog replays it in.
         let stamp = |event: &DataEvent| match event {
             DataEvent::Data(Data::BookDeltas(deltas)) => Some((deltas.sequence, deltas.ts_init)),
             _ => None,

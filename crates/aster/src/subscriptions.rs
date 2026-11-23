@@ -7,7 +7,6 @@ use nautilus_model::{data::Data, identifiers::InstrumentId};
 
 use crate::feed::stream_symbol;
 
-/// A kind of data a subscriber can ask for, per instrument.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Kind {
     Book,
@@ -19,7 +18,6 @@ pub(crate) enum Kind {
 }
 
 impl Kind {
-    /// The stream that carries this kind. Mark, index, and funding share one.
     pub(crate) fn stream(self, instrument_id: &InstrumentId) -> String {
         let channel = match self {
             Self::Book => "depth@100ms",
@@ -49,25 +47,18 @@ pub(crate) enum Command {
     Unsubscribe(InstrumentId, Kind),
 }
 
-/// The net effect of a batch of commands on the wire.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Changes {
-    /// Streams to `SUBSCRIBE`, sorted.
     pub(crate) opened: Vec<String>,
-    /// Streams to `UNSUBSCRIBE`, sorted.
     pub(crate) closed: Vec<String>,
-    /// Instruments whose book subscription ended at some point in the batch.
     pub(crate) books_ended: Vec<InstrumentId>,
-    /// Subscriptions refused because the connection is at its stream limit.
     pub(crate) rejected: Vec<(InstrumentId, Kind)>,
 }
 
 #[derive(Debug)]
 pub(crate) struct Subscriptions {
-    /// The most streams the connections can carry between them.
     capacity: usize,
     wanted: AHashSet<(InstrumentId, Kind)>,
-    /// Number of subscriptions relying on each stream.
     streams: AHashMap<String, usize>,
 }
 
@@ -80,7 +71,6 @@ impl Subscriptions {
         }
     }
 
-    /// Instruments subscribed to `kind`.
     pub(crate) fn instruments(&self, kind: Kind) -> impl Iterator<Item = InstrumentId> + '_ {
         self.wanted
             .iter()
@@ -88,7 +78,6 @@ impl Subscriptions {
             .map(|(instrument_id, _)| *instrument_id)
     }
 
-    /// Whether any subscription relies on `stream`.
     pub(crate) fn uses(&self, stream: &str) -> bool {
         self.streams.contains_key(stream)
     }
@@ -97,13 +86,8 @@ impl Subscriptions {
         self.wanted.contains(&(instrument_id, kind))
     }
 
-    /// Applies commands in order and returns what must change on the wire.
-    ///
-    /// A stream that ends the batch in the state it started in produces no
-    /// message, however many times it flipped in between.
     pub(crate) fn apply(&mut self, commands: &[Command]) -> Changes {
         let mut changes = Changes::default();
-        // Whether each touched stream was open before the batch.
         let mut before: AHashMap<String, bool> = AHashMap::new();
 
         for command in commands {
@@ -204,14 +188,11 @@ mod tests {
         let on = Command::Subscribe(btc(), Kind::Quotes);
         let off = Command::Unsubscribe(btc(), Kind::Quotes);
 
-        // Closed before: on, off, on must still open the stream.
         let mut subs = Subscriptions::new(MAX_STREAMS);
         assert_eq!(subs.apply(&[on, off, on]).opened, ["btcusdt@bookTicker"]);
 
-        // Open before: off, on, off must still close it.
         assert_eq!(subs.apply(&[off, on, off]).closed, ["btcusdt@bookTicker"]);
 
-        // Ending where it started sends nothing.
         assert_eq!(subs.apply(&[on, off]), Changes::default());
         subs.apply(&[on]);
         assert_eq!(subs.apply(&[off, on]), Changes::default());
@@ -245,7 +226,6 @@ mod tests {
             "a rejected subscription is not recorded"
         );
 
-        // A kind that reuses an open stream still fits.
         let first = instrument_id("S0USDT");
         subs.apply(&[Command::Subscribe(first, Kind::MarkPrice)]);
         assert!(

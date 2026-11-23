@@ -92,7 +92,6 @@ struct Probe {
 impl Probe {
     fn emitted(&mut self, batch: &OrderBookDeltas) -> Result<()> {
         ensure!(!batch.deltas.is_empty(), "empty adapter book batch");
-        // A batch can contain more than one F_LAST boundary. Keep a view at every boundary.
         for group in batch
             .deltas
             .split_inclusive(|delta| delta.flags & F_LAST != 0)

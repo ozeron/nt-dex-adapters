@@ -61,25 +61,17 @@ use crate::{
     },
 };
 
-/// How often streams that could not be opened are tried again.
 const SUBSCRIBE_RETRY_INTERVAL: Duration = Duration::from_secs(5);
-/// How often books that are not in sync are reported.
 const BOOK_HEALTH_INTERVAL: Duration = Duration::from_mins(1);
-/// Funding history rows per request, the venue's maximum.
 const FUNDING_PAGE: usize = 1000;
-/// Recent trades per request, the venue's maximum.
 const TRADES_PAGE: usize = 1000;
-/// Pages fetched for one funding history request at most.
 const FUNDING_MAX_PAGES: usize = 20;
-/// The longest funding interval the venue uses, eight hours, in milliseconds.
 const FUNDING_LONGEST_MS: u64 = 8 * 60 * 60 * 1_000;
 const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The background task that owns the socket and the feed.
 struct Session {
     feed: AsterFeed,
     pool: StreamPool,
-    /// Streams the pool could not open yet.
     unplaced: Vec<String>,
     http: AsterHttpClient,
     sender: EventSender<DataEvent>,
@@ -91,13 +83,10 @@ struct Session {
     snapshots_tx: UnboundedSender<SnapshotMessage>,
     cancel: CancellationToken,
     events: Vec<FeedEvent>,
-    /// When the next book snapshot may be requested, to stay inside the
-    /// venue's request weight.
     next_snapshot_at: Instant,
     snapshot_spacing: Duration,
 }
 
-/// Request weight of one depth snapshot at `limit` levels.
 const fn snapshot_weight(limit: u16) -> u32 {
     match limit {
         0..=50 => 2,
@@ -107,7 +96,6 @@ const fn snapshot_weight(limit: u16) -> u32 {
     }
 }
 
-/// Time between snapshot requests that keeps them within the weight budget.
 fn snapshot_spacing(config: &AsterDataClientConfig) -> Duration {
     let weight = snapshot_weight(config.book_snapshot_depth);
     Duration::from_mins(1)
@@ -144,7 +132,6 @@ impl Session {
             .is_some_and(|id| self.subscriptions.wants(id, Kind::Book))
     }
 
-    /// Forgets a book and invalidates any snapshot request in flight for it.
     fn reset_book(&mut self, symbol: Ustr) {
         self.feed.reset_book(symbol.as_str());
         self.recoveries.remove(&symbol);
@@ -152,7 +139,6 @@ impl Session {
             .retain(|request| request.symbol != symbol);
     }
 
-    /// Applies a batch of commands with at most one message per direction.
     async fn apply(&mut self, commands: &[Command]) {
         let changes = self.subscriptions.apply(commands);
         for (instrument_id, kind) in &changes.rejected {
@@ -164,8 +150,6 @@ impl Session {
         for instrument_id in &changes.books_ended {
             self.reset_book(Ustr::from(common::raw_symbol(instrument_id)));
         }
-        // Streams still waiting for a connection go out with the new ones,
-        // unless this batch closed them.
         let mut opening = std::mem::take(&mut self.unplaced);
         opening.retain(|stream| !changes.closed.contains(stream));
         opening.extend(changes.opened);
@@ -223,16 +207,10 @@ impl Session {
                     if self.book_wanted(symbol) {
                         self.request_snapshot(symbol);
                     } else {
-                        // A depth frame that was already queued when the book
-                        // was unsubscribed. Forget it, so a later subscription
-                        // starts clean and asks for its own snapshot.
                         self.reset_book(symbol);
                     }
                 }
                 FeedEvent::Data(data) => {
-                    // Mark, index, and funding arrive together on one stream.
-                    // Like the Binance client, subscribing to any of them
-                    // publishes all three.
                     let wanted = Kind::of(&data).is_some_and(|(id, kind)| match kind {
                         Kind::MarkPrice | Kind::IndexPrice | Kind::FundingRate => {
                             self.subscriptions.wants(id, Kind::MarkPrice)
@@ -257,7 +235,6 @@ impl Session {
             );
             let (streams, unsent) = self.pool.resubscribe(slot).await;
             self.unplaced.extend(unsent);
-            // Only the books carried by this connection missed updates.
             let books: Vec<InstrumentId> = self
                 .subscriptions
                 .instruments(Kind::Book)
@@ -283,10 +260,8 @@ impl Session {
             }
         };
         if envelope.stream.is_none() && envelope.data.is_none() {
-            // A control reply. Streams the venue refused are tried again.
             let refused = self.pool.on_reply(slot, text);
             self.unplaced.extend(refused);
-            // One that was unsubscribed in the meantime is not reopened.
             self.unplaced
                 .retain(|stream| self.subscriptions.uses(stream));
             return;
@@ -328,7 +303,6 @@ impl Session {
             self.feed
                 .handle_depth_snapshot(symbol.as_str(), body, ts_init, &mut self.events);
         if cancellation.is_cancelled() || !fence.is_current() {
-            // Decoding a large snapshot and its buffered suffix takes time.
             self.events.truncate(previous_events);
             self.feed.reset_book(symbol.as_str());
             return Err(SnapshotError::Obsolete);
@@ -356,9 +330,6 @@ impl Session {
         }
     }
 
-    /// Tells the operator about subscribed books that are not publishing: a
-    /// book waiting for its snapshot, or one the venue has sent no update
-    /// for since it was subscribed.
     fn report_unsynced_books(&self) {
         let subscribed = self.subscriptions.instruments(Kind::Book).count();
         let silent = self
@@ -408,7 +379,6 @@ impl Session {
             tokio::select! {
                 biased;
                 () = self.cancel.cancelled() => {
-                    // Publish what had already arrived before stopping.
                     frames.close();
                     if let Some(frame) = oldest_frame.take() {
                         self.on_message(frame).await;
@@ -420,7 +390,6 @@ impl Session {
                 }
                 _ = health.tick() => {
                     self.report_unsynced_books();
-                    // Keep the queue head in order while sampling its receive timestamp.
                     if oldest_frame.is_none() {
                         oldest_frame = frames.try_recv().ok();
                     }
@@ -454,8 +423,6 @@ impl Session {
                 Some(update) = updates.recv() => {
                     for instrument in &update.instruments {
                         self.feed.add_instrument(instrument);
-                        // A changed definition may change the precision of
-                        // the levels, so the book starts again.
                         self.reset_book(instrument.raw_symbol().inner());
                     }
                     if let Some(intervals) = &update.funding_intervals {
@@ -476,7 +443,6 @@ impl Session {
     }
 }
 
-/// Replaces the cached instruments with `instruments`.
 fn store_instruments(
     cache: &AtomicMap<InstrumentId, InstrumentAny>,
     instruments: &[InstrumentAny],
@@ -489,20 +455,15 @@ fn store_instruments(
     );
 }
 
-/// Whether `ts` lies inside the optional, inclusive `start..=end` window.
 fn in_window(ts: UnixNanos, start: Option<UnixNanos>, end: Option<UnixNanos>) -> bool {
     start.is_none_or(|start| ts >= start) && end.is_none_or(|end| ts <= end)
 }
 
-/// New or changed venue metadata for the session's feed.
 struct InstrumentUpdate {
     instruments: Vec<InstrumentAny>,
-    /// `None` when the venue's intervals could not be loaded.
     funding_intervals: Option<Vec<(String, u16)>>,
 }
 
-/// Reloads instruments and funding intervals on an interval, publishing
-/// what changed.
 struct Refresher {
     http: AsterHttpClient,
     clock: &'static AtomicTime,
@@ -531,7 +492,6 @@ impl Refresher {
                 return;
             }
         };
-        // A failed or empty load keeps the intervals already known.
         let funding_intervals = match self.http.request_funding_intervals().await {
             Ok(intervals) if !intervals.is_empty() => Some(intervals),
             Ok(_) => None,
@@ -541,8 +501,6 @@ impl Refresher {
             }
         };
 
-        // A symbol the venue still lists but whose definition did not parse
-        // keeps its last good definition. It has not been delisted.
         let cached = self.instruments.load();
         let mut loaded = parsed.instruments;
         for (symbol, error) in &parsed.failed {
@@ -579,7 +537,6 @@ impl Refresher {
         for instrument in &instruments {
             self.publish(instrument.clone().into());
         }
-        // The receiver only closes when the session has ended.
         let _ = self.updates.send(InstrumentUpdate {
             instruments,
             funding_intervals,
@@ -589,7 +546,6 @@ impl Refresher {
     async fn run(self, every: Duration, cancel: CancellationToken) {
         let mut ticker = tokio::time::interval(every);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        // The first tick fires at once; connect has just loaded everything.
         ticker.tick().await;
         loop {
             tokio::select! {
@@ -601,7 +557,6 @@ impl Refresher {
     }
 }
 
-/// Owns the tasks and command channel for one live session.
 #[derive(Debug)]
 struct RunningSession {
     commands: UnboundedSender<Command>,
@@ -624,7 +579,6 @@ impl RunningSession {
 
     async fn shutdown(&mut self) {
         self.stop();
-        // Join the refresher before a new session can write to the shared cache.
         if let Some(refresher) = &mut self.refresher {
             let _ = refresher.await;
             self.refresher = None;
@@ -648,7 +602,6 @@ impl Drop for RunningSession {
     }
 }
 
-/// Market-data client for Aster perpetual futures.
 #[derive(Debug)]
 pub struct AsterDataClient {
     client_id: ClientId,
@@ -661,11 +614,6 @@ pub struct AsterDataClient {
 }
 
 impl AsterDataClient {
-    /// Creates a client. Must be called on the node's runner thread.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the HTTP client cannot be built.
     pub fn new(client_id: ClientId, config: AsterDataClientConfig) -> anyhow::Result<Self> {
         let http = AsterHttpClient::new(&config.base_url_http, config.http_timeout_secs)?;
         Ok(Self {
@@ -736,8 +684,6 @@ impl AsterDataClient {
     }
 
     fn unsubscribe_kind(&self, instrument_ids: &[InstrumentId], kind: Kind) -> anyhow::Result<()> {
-        // No check that the instrument is known: one the venue has delisted
-        // must still be possible to unsubscribe.
         execute_instrument_subscriptions(instrument_ids, |instrument_id| {
             self.send(Command::Unsubscribe(instrument_id, kind))
         })
@@ -845,8 +791,6 @@ impl DataClient for AsterDataClient {
             frames_tx,
             self.clock,
         );
-        // Open the first connection now, so a venue that cannot be reached
-        // fails the connect instead of the first subscription.
         pool.open_connection().await?;
 
         let (commands_tx, commands_rx) = unbounded_channel();
@@ -901,9 +845,6 @@ impl DataClient for AsterDataClient {
         Ok(())
     }
 
-    // Instruments are published on connect and whenever a refresh finds a
-    // change, so there is nothing to start here. Publishing them again would
-    // write duplicates to the catalog. The Binance client does the same.
     fn subscribe_instruments(&mut self, _cmd: SubscribeInstruments) -> anyhow::Result<()> {
         Ok(())
     }
@@ -999,11 +940,6 @@ impl DataClient for AsterDataClient {
         Ok(())
     }
 
-    /// Returns the most recent individual trades inside the request's window.
-    ///
-    /// The venue serves only its latest 1000 trades of a symbol and has no
-    /// time filter, so older history cannot be requested. A window is cut
-    /// from a full page; `limit` then keeps the newest trades.
     fn request_trades(&self, request: RequestTrades) -> anyhow::Result<()> {
         let instrument_id = request.single_instrument_id()?;
         let instrument = self.instrument(instrument_id)?;
@@ -1076,10 +1012,6 @@ impl DataClient for AsterDataClient {
         get_runtime().spawn(async move {
             let to_millis = |nanos: UnixNanos| nanos.as_u64() / 1_000_000;
             let end_ms = end.map(to_millis);
-            // With an end and no start the venue answers from its oldest
-            // row, so search a window wide enough to hold the latest rows
-            // before the end at the longest funding interval, and keep the
-            // last of them.
             let tail = start.is_none() && end.is_some();
             let mut from_ms = if tail {
                 let rows = u64::try_from(limit.unwrap_or(FUNDING_PAGE)).unwrap_or(u64::MAX);
@@ -1088,7 +1020,6 @@ impl DataClient for AsterDataClient {
                 start.map(to_millis)
             };
             let mut rates = Vec::new();
-            // The last payment of the page before, to time the next one from.
             let mut previous = None;
             for _ in 0..FUNDING_MAX_PAGES {
                 let wanted = match limit {
@@ -1116,14 +1047,11 @@ impl DataClient for AsterDataClient {
                 let last = page.last().map(|rate| to_millis(rate.ts_event));
                 previous = last.or(previous);
                 rates.extend(page);
-                // Without a start the venue returns the most recent rows,
-                // which cannot be paged forwards.
                 match (full, from_ms, last) {
                     (true, Some(_), Some(last)) => from_ms = Some(last.saturating_add(1)),
                     _ => break,
                 }
             }
-            // The venue works in milliseconds; the request is in nanoseconds.
             rates.retain(|rate| in_window(rate.ts_event, start, end));
             if let Some(limit) = limit {
                 let excess = rates.len().saturating_sub(limit);

@@ -42,7 +42,6 @@ impl DataActor for BarSubscriber {
     }
 
     fn on_stop(&mut self) -> anyhow::Result<()> {
-        // Let Trader retirement release the subscription.
         Ok(())
     }
 
@@ -99,7 +98,6 @@ fn wire_unsubscribes(venue: &Venue) -> Vec<(usize, Vec<String>)> {
         .collect()
 }
 
-/// TC-D73, following `NautilusTrader` 0.68.0 `trader.rs:6184` through the live socket.
 #[test]
 fn tc_d73_shared_trade_bar_releases_venue_stream_after_final_actor() {
     run(async {
@@ -156,9 +154,6 @@ fn tc_d73_shared_trade_bar_releases_venue_stream_after_final_actor() {
             trader.borrow_mut().remove_actor(&first).unwrap();
             assert_eq!(msgbus::exact_subscriber_count_bars(topic), 1);
 
-            // Queue an independent stream behind the first removal. Its wire subscribe
-            // shows the node has processed the preceding data commands, and the quote
-            // stream will still be available to fence late trades after final removal.
             subscribe_quotes(instrument);
             assert_eq!(venue.wait_for_stream(QUOTE_STREAM).await, connection);
             assert_eq!(venue.wait_for_stream(TRADE_STREAM).await, connection);
@@ -183,8 +178,6 @@ fn tc_d73_shared_trade_bar_releases_venue_stream_after_final_actor() {
                 vec![BTreeSet::from([QUOTE_STREAM.to_owned()])]
             );
 
-            // Send a late pair through the real socket, followed by a quote on the
-            // same connection. Seeing the quote in the node drains that input prefix.
             push_trade_pair(&venue, connection, 104, "75", "76");
             venue.push_on(connection, WS_BOOK_TICKER);
             tokio::time::timeout(TIMEOUT, async {
@@ -198,8 +191,6 @@ fn tc_d73_shared_trade_bar_releases_venue_stream_after_final_actor() {
             Ok(connection)
         };
 
-        // Keep both futures on the node's thread-local message bus and service the
-        // live runner throughout actor registration, delivery, and retirement.
         let ((), connection) = tokio::time::timeout(TIMEOUT * 2, async {
             tokio::try_join!(node.run_with_mode(NodeRunMode::Hosted), exercise)
         })

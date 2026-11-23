@@ -4541,6 +4541,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nt-dex-rust-comments"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ra-ap-rustc_lexer",
+]
+
+[[package]]
 name = "ntapi"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5143,6 +5151,17 @@ name = "r-efi"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
+name = "ra-ap-rustc_lexer"
+version = "0.186.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ce72655640ce0af6338422cb744cdb72454e21bb20275dcfd128024f848480a"
+dependencies = [
+ "memchr",
+ "unicode-ident",
+ "unicode-properties",
+]
 
 [[package]]
 name = "radium"
@@ -6692,6 +6711,12 @@ name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
+
+[[package]]
+name = "unicode-properties"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "993ad287eb20e8ba755312801cfe1413e0f25d604075863acaddca10b04c1833"
 
 [[package]]
 name = "unicode-segmentation"

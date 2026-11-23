@@ -7,7 +7,7 @@ Out-of-tree Rust market-data clients for NautilusTrader perpetual futures. Aster
 | `crates/aster` | Aster adapter: instruments, parsers, book sync, live data client. The reference for later venue crates |
 | `bins/node` | `nt-dex-node`: records the live Aster feed into a Parquet catalog, imports a capture into one, and summarises one |
 | `tools/capture` | `nt-dex-capture`: records raw public feed sessions to JSONL for fixtures and replay tests |
-| `scripts/gate.sh` | Format, lint, test, and audit the whole workspace |
+| `scripts/gate.sh` | Check Rust comment placement, format, lint, test, and audit the workspace |
 | `AGENTS.md` | Per-venue build and qualification checklist |
 | `docs/connector-checklist.jsonl` | Reusable NautilusTrader market-data implementation and conformance checks |
 | `docs/data.md` | What the recorded catalog contains and how to read it: book sync, prices, funding, timestamps |
@@ -29,7 +29,7 @@ cargo test -p nt-dex-aster --test live_client               # data client agains
 cargo run -p nt-dex-aster --example book_stress -- preflight 15   # compare L2 with a separate live top-20 stream
 cargo run -p nt-dex-aster --example book_stress -- recovery 10 1  # one round of live recovery checks, about 46 seconds
 cargo run -p nt-dex-node -- summary <dir>                   # read the catalog back
-scripts/gate.sh      # fmt + clippy + tests + cargo-deny for the whole workspace
+scripts/gate.sh      # comment placement, fmt, clippy, tests, and cargo-deny
 ```
 
 Install the two helper tools with `brew install bacon cargo-deny`. Lints are set to `warn` in `Cargo.toml` so they never block the edit loop; the gate runs clippy with `-D warnings`. Use `cargo build --profile debugging` when a debugger needs full debug info; the default dev profile keeps only line tables.

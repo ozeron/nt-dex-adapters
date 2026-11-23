@@ -18,7 +18,6 @@ impl ClientConfig for AsterDataClientConfig {
     }
 }
 
-/// Creates [`AsterDataClient`] instances for a node.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct AsterDataClientFactory;
 

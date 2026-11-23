@@ -41,20 +41,15 @@ use nt_dex_aster::{
     http::client::AsterHttpClient,
 };
 
-/// What to record and where.
 #[derive(Debug)]
 pub(crate) struct RecordOptions {
     pub(crate) catalog_dir: String,
     pub(crate) symbols: Vec<String>,
-    /// Record every trading instrument instead of `symbols`.
     pub(crate) all: bool,
-    /// Stop after this long; run until Ctrl-C when `None`.
     pub(crate) duration: Option<Duration>,
-    /// How often staged files are sealed and promoted into the catalog.
     pub(crate) rotate: Duration,
 }
 
-/// Event counts and trade latency, shared with the reporting loop.
 #[derive(Debug, Default)]
 struct Counters {
     instruments: AtomicU64,
@@ -65,10 +60,8 @@ struct Counters {
     mark_prices: AtomicU64,
     index_prices: AtomicU64,
     funding_rates: AtomicU64,
-    /// Sum and maximum of trade `ts_init - ts_event`, in microseconds.
     trade_lag_sum_us: AtomicU64,
     trade_lag_max_us: AtomicU64,
-    /// Maximum socket-to-actor age plus one. Zero means no mark was dispatched.
     mark_dispatch_age_max_us: AtomicU64,
 }
 
@@ -113,9 +106,6 @@ impl Counters {
     }
 }
 
-/// Subscribes to everything the client offers for the chosen instruments.
-/// The streaming writer does the recording; this actor only creates the
-/// demand and counts what arrives.
 #[derive(Debug)]
 struct Recorder {
     core: DataActorCore,
@@ -192,7 +182,6 @@ impl DataActor for Recorder {
     }
 }
 
-/// Matches sealed `.feather` files and in-progress `.feather.partial` files.
 fn is_staged_file(path: &Path) -> bool {
     let extension = path.extension();
     let feather = Some(OsStr::new("feather"));
@@ -204,7 +193,6 @@ fn is_staged_file(path: &Path) -> bool {
                 == feather)
 }
 
-/// Lists the data files under the staging directory.
 fn staged_files(dir: &Path) -> anyhow::Result<BTreeSet<PathBuf>> {
     fn walk(dir: &Path, found: &mut BTreeSet<PathBuf>) -> anyhow::Result<()> {
         let entries = std::fs::read_dir(dir)
@@ -229,10 +217,6 @@ fn staged_files(dir: &Path) -> anyhow::Result<BTreeSet<PathBuf>> {
     Ok(found)
 }
 
-/// Checks that the run's data reached the catalog: nothing of this run left
-/// staged, every requested instrument has mark prices, which the venue sends
-/// each second for every market however quiet, and no fewer trades are
-/// stored than were received.
 fn verify(
     catalog_dir: &str,
     staging: &Path,
@@ -266,8 +250,6 @@ fn verify(
     );
     let trades = counters.trades.load(Ordering::Relaxed);
     let stored = catalog.trade_ticks(None, Some(run_start), None)?.len();
-    // The writer keeps recording for a moment after the counting actor has
-    // stopped, so the catalog may hold a few more, but never fewer.
     anyhow::ensure!(
         u64::try_from(stored)? >= trades,
         "the catalog holds {stored} trades from this run but {trades} were received"
@@ -275,8 +257,6 @@ fn verify(
     Ok(())
 }
 
-/// Feather staging next to the catalog, promoted into it on every rotation
-/// and on close.
 fn streaming_config(
     options: &RecordOptions,
     staging_dir: String,
@@ -302,7 +282,6 @@ fn streaming_config(
     Ok(streaming)
 }
 
-/// Runs the recording node until the duration elapses or Ctrl-C.
 pub(crate) async fn record(options: RecordOptions) -> anyhow::Result<()> {
     let config = AsterDataClientConfig::default();
     let instrument_ids: Vec<InstrumentId> = if options.all {
@@ -392,7 +371,6 @@ pub(crate) async fn record(options: RecordOptions) -> anyhow::Result<()> {
 
     let result = node.run().await;
     reporter.abort();
-    // Dispose closes the writer, which promotes what is still staged.
     node.dispose();
     verify(
         &options.catalog_dir,

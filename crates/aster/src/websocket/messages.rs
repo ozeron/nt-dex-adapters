@@ -5,9 +5,6 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 use smallvec::SmallVec;
 
-/// Combined-stream wrapper: `{"stream": "btcusdt@aggTrade", "data": {...}}`.
-///
-/// Control replies such as `{"result": null, "id": 1}` have neither field.
 #[derive(Debug, Deserialize)]
 pub struct Envelope<'a> {
     pub stream: Option<&'a str>,
@@ -21,7 +18,6 @@ impl<'a> Envelope<'a> {
     }
 }
 
-/// `<symbol>@depth`: a diff of absolute level quantities.
 #[derive(Debug, Deserialize)]
 pub struct DepthUpdate<'a, Levels = Vec<[&'a str; 2]>> {
     #[serde(rename = "T")]
@@ -42,7 +38,6 @@ pub struct DepthUpdate<'a, Levels = Vec<[&'a str; 2]>> {
 
 pub(crate) type InlineDepthUpdate<'a> = DepthUpdate<'a, SmallVec<[[&'a str; 2]; 8]>>;
 
-/// `<symbol>@aggTrade`: fills of one taker order at one price.
 #[derive(Debug, Deserialize)]
 pub struct AggTrade<'a> {
     #[serde(rename = "a")]
@@ -59,18 +54,12 @@ pub struct AggTrade<'a> {
     pub last_trade_id: u64,
     #[serde(rename = "T")]
     pub trade_time: u64,
-    /// `true` when the buyer was the maker, so the aggressor sold.
     #[serde(rename = "m")]
     pub buyer_is_maker: bool,
 }
 
-/// `<symbol>@trade`: one fill.
-///
-/// The venue's `X` field (order type, `"MARKET"` in every sample) is not
-/// read, as in the Binance futures client: every trade is published.
 #[derive(Debug, Deserialize)]
 pub struct Trade<'a> {
-    /// Consecutive per symbol.
     #[serde(rename = "t")]
     pub trade_id: u64,
     #[serde(rename = "s")]
@@ -81,12 +70,10 @@ pub struct Trade<'a> {
     pub quantity: &'a str,
     #[serde(rename = "T")]
     pub trade_time: u64,
-    /// `true` when the buyer was the maker, so the aggressor sold.
     #[serde(rename = "m")]
     pub buyer_is_maker: bool,
 }
 
-/// `<symbol>@bookTicker`: best bid and ask.
 #[derive(Debug, Deserialize)]
 pub struct BookTicker<'a> {
     #[serde(rename = "s")]
@@ -103,7 +90,6 @@ pub struct BookTicker<'a> {
     pub transaction_time: u64,
 }
 
-/// `<symbol>@markPrice`: mark price, index price, and funding.
 #[derive(Debug, Deserialize)]
 pub struct MarkPrice<'a> {
     #[serde(rename = "E")]
