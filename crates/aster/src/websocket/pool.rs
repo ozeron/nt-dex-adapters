@@ -93,6 +93,10 @@ impl ReconnectFence {
     pub(crate) fn is_current(&self) -> bool {
         self.received.load(Ordering::Acquire) == self.epoch
     }
+
+    pub(crate) fn matches(&self, other: &Self) -> bool {
+        self.epoch == other.epoch && Arc::ptr_eq(&self.received, &other.received)
+    }
 }
 
 /// Splits `streams` into runs that each fit one control message.
@@ -418,6 +422,8 @@ mod tests {
         let mut epoch = ReconnectEpoch::default();
         let queued = epoch.fence();
         assert!(queued.is_current());
+        assert!(queued.matches(&epoch.fence()));
+        assert!(!queued.matches(&ReconnectEpoch::default().fence()));
         epoch.received.store(2, Ordering::Release);
         assert!(!queued.is_current());
         assert!(!epoch.fence().is_current());
@@ -426,6 +432,7 @@ mod tests {
         epoch.consumed = 2;
         assert!(epoch.fence().is_current());
         assert!(!queued.is_current());
+        assert!(!queued.matches(&epoch.fence()));
     }
 
     #[test]

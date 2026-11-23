@@ -30,8 +30,9 @@ use nautilus_common::{
     messages::{
         DataEvent,
         data::{
-            DataResponse, RequestFundingRates, RequestTrades, SubscribeBookDeltas,
-            SubscribeFundingRates, SubscribeQuotes, SubscribeTrades, UnsubscribeTrades,
+            DataResponse, RequestFundingRates, RequestInstrument, RequestInstruments,
+            RequestTrades, SubscribeBookDeltas, SubscribeFundingRates, SubscribeQuotes,
+            SubscribeTrades, UnsubscribeTrades,
         },
     },
 };
@@ -48,6 +49,7 @@ use nt_dex_aster::{
     config::AsterDataClientConfig,
     data::AsterDataClient,
 };
+use rust_decimal::Decimal;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
@@ -57,6 +59,9 @@ use tokio::{
     },
 };
 use tokio_tungstenite::tungstenite::Message;
+
+#[path = "live_client/shared_trade_bar.rs"]
+mod shared_trade_bar;
 
 const EXCHANGE_INFO: &str = include_str!("../test_data/http_exchange_info.json");
 const FUNDING_INFO: &str = include_str!("../test_data/http_funding_info.json");
@@ -928,7 +933,7 @@ fn reconnect_resubscribes_and_resyncs_the_book() {
 }
 
 #[test]
-fn reconnect_retires_an_in_flight_snapshot_before_starting_a_new_book() {
+fn reconnect_keeps_the_recovery_and_discards_its_old_snapshot() {
     run(async {
         let mut harness = Harness::start(|_| {}).await;
         harness.subscribe_book(&["SOLUSDT"]);
@@ -955,6 +960,13 @@ fn reconnect_retires_an_in_flight_snapshot_before_starting_a_new_book() {
         harness
             .venue
             .push_on(new_slot, &depth_diff(1_990, 2_005, 1_980));
+        harness
+            .expect_none("snapshot before the old attempt finishes", |event| {
+                book(event).is_some()
+            })
+            .await;
+        assert_eq!(harness.venue.requests("/fapi/v1/depth"), 1);
+        resume.send(()).unwrap();
         assert_eq!(
             harness.next("new generation snapshot", book).await,
             (2_000, true)
@@ -963,9 +975,107 @@ fn reconnect_retires_an_in_flight_snapshot_before_starting_a_new_book() {
             harness.next("new generation diff", book).await,
             (2_005, false)
         );
-        resume.send(()).unwrap();
         harness
             .expect_none("retired snapshot", |event| book(event).is_some())
+            .await;
+        assert_eq!(harness.venue.requests("/fapi/v1/depth"), 2);
+        harness.stop().await;
+    });
+}
+
+#[test]
+fn snapshot_deadline_retries_a_stalled_http_request() {
+    run(async {
+        let mut harness = Harness::start(|config| config.book_snapshot_timeout_secs = 1).await;
+        harness.subscribe_book(&["SOLUSDT"]);
+        let (received, started) = oneshot::channel();
+        let (resume, paused) = oneshot::channel();
+        {
+            let mut state = harness.venue.state.lock().unwrap();
+            state.snapshot_update_id = 0;
+            state.pause_next_snapshot = Some((received, paused));
+        }
+        harness.venue.push(&depth_diff(990, 1_005, 980)).await;
+        tokio::time::timeout(TIMEOUT, started)
+            .await
+            .unwrap()
+            .unwrap();
+        harness.venue.state.lock().unwrap().snapshot_update_id = 1_000;
+
+        assert_eq!(
+            harness.next("snapshot after deadline", book).await,
+            (1_000, true)
+        );
+        assert_eq!(
+            harness.next("diff after deadline", book).await,
+            (1_005, false)
+        );
+        assert_eq!(harness.venue.requests("/fapi/v1/depth"), 2);
+        resume.send(()).unwrap();
+        harness
+            .expect_none("expired snapshot", |event| book(event).is_some())
+            .await;
+        harness.stop().await;
+    });
+}
+
+#[test]
+fn final_book_unsubscribe_cancels_its_pending_snapshot() {
+    use nautilus_common::messages::data::UnsubscribeBookDeltas;
+
+    run(async {
+        let mut harness = Harness::start(|_| {}).await;
+        let sol = instrument_id("SOLUSDT");
+        harness.subscribe_book(&["SOLUSDT"]);
+        let (received, started) = oneshot::channel();
+        let (resume, paused) = oneshot::channel();
+        {
+            let mut state = harness.venue.state.lock().unwrap();
+            state.snapshot_update_id = 1_000;
+            state.pause_next_snapshot = Some((received, paused));
+        }
+        harness.venue.push(&depth_diff(990, 1_005, 980)).await;
+        tokio::time::timeout(TIMEOUT, started)
+            .await
+            .unwrap()
+            .unwrap();
+        let client_id = Some(harness.client.client_id());
+        harness
+            .client
+            .unsubscribe_book_deltas(&UnsubscribeBookDeltas::new(
+                sol,
+                client_id,
+                None,
+                UUID4::new(),
+                UnixNanos::default(),
+                None,
+                None,
+            ))
+            .unwrap();
+        harness
+            .venue
+            .wait_for_unsubscribe(|streams| {
+                streams.iter().any(|stream| stream == "solusdt@depth@100ms")
+            })
+            .await;
+
+        // A new subscription on the same socket must own an independent recovery.
+        harness.venue.state.lock().unwrap().snapshot_update_id = 2_000;
+        harness.subscribe_book(&["SOLUSDT"]);
+        harness.venue.push(&depth_diff(1_990, 2_005, 1_980)).await;
+        assert_eq!(
+            harness.next("new subscription snapshot", book).await,
+            (2_000, true)
+        );
+        assert_eq!(
+            harness.next("new subscription diff", book).await,
+            (2_005, false)
+        );
+        resume.send(()).unwrap();
+        harness
+            .expect_none("retired subscription snapshot", |event| {
+                book(event).is_some()
+            })
             .await;
         assert_eq!(harness.venue.requests("/fapi/v1/depth"), 2);
         harness.stop().await;
@@ -1130,6 +1240,88 @@ fn refresh_publishes_changed_instruments_and_retires_removed_ones() {
 
         // A delisted instrument can no longer be subscribed.
         assert!(harness.try_subscribe_trades(&["BTCUSDT"]).is_err());
+        harness.stop().await;
+    });
+}
+
+#[test]
+fn instrument_requests_observe_changes_before_the_next_refresh() {
+    run(async {
+        let mut harness = Harness::start(|_| {}).await;
+        let sol = instrument_id("SOLUSDT");
+        let client_id = harness.client.client_id();
+        let mut updated: serde_json::Value = serde_json::from_str(EXCHANGE_INFO).unwrap();
+        let symbol = updated["symbols"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|symbol| symbol["symbol"] == "SOLUSDT")
+            .unwrap();
+        let filter = symbol["filters"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|filter| filter["filterType"] == "MIN_NOTIONAL")
+            .unwrap();
+        filter["notional"] = "10".into();
+
+        for (info, expected) in [(EXCHANGE_INFO.to_owned(), 5), (updated.to_string(), 10)] {
+            harness.venue.state.lock().unwrap().exchange_info = info;
+            let single_id = UUID4::new();
+            let list_id = UUID4::new();
+            harness
+                .client
+                .request_instrument(RequestInstrument::new(
+                    sol,
+                    None,
+                    None,
+                    Some(client_id),
+                    single_id,
+                    UnixNanos::default(),
+                    None,
+                ))
+                .unwrap();
+            let single_notional = harness
+                .next("single instrument response", |event| match event {
+                    DataEvent::Response(DataResponse::Instrument(response)) => {
+                        assert_eq!(response.correlation_id, single_id);
+                        assert_eq!(response.instrument_id, sol);
+                        assert_eq!(response.data.id(), sol);
+                        Some(response.data.min_notional().unwrap().as_decimal())
+                    }
+                    _ => None,
+                })
+                .await;
+            harness
+                .client
+                .request_instruments(RequestInstruments::new(
+                    None,
+                    None,
+                    None,
+                    Some(sol.venue),
+                    list_id,
+                    UnixNanos::default(),
+                    None,
+                ))
+                .unwrap();
+            let list_notional = harness
+                .next("instrument list response", |event| match event {
+                    DataEvent::Response(DataResponse::Instruments(response)) => {
+                        assert_eq!(response.correlation_id, list_id);
+                        assert_eq!(response.client_id, client_id);
+                        let instrument =
+                            response.data.iter().find(|item| item.id() == sol).unwrap();
+                        Some(instrument.min_notional().unwrap().as_decimal())
+                    }
+                    _ => None,
+                })
+                .await;
+            assert_eq!(
+                [single_notional, list_notional],
+                [Decimal::from(expected); 2]
+            );
+        }
+        assert_eq!(harness.venue.requests("/fapi/v1/exchangeInfo"), 5);
         harness.stop().await;
     });
 }

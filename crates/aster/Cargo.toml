@@ -13,21 +13,24 @@ itoa = "1"
 log = "0.4"
 nautilus-common.workspace = true
 nautilus-core.workspace = true
+nautilus-live.workspace = true
 nautilus-model.workspace = true
 nautilus-network.workspace = true
 rust_decimal = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 smallvec = { version = "1", features = ["serde"] }
+thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tokio-tungstenite = "0.30"
 tokio-util = "0.7"
 ustr = "1"
 
 [dev-dependencies]
-nautilus-live = { workspace = true, features = ["node"] }
+nautilus-live = { workspace = true, features = ["node", "test-support"] }
 nautilus-testkit.workspace = true
 futures-util = "0.3"
+proptest = { version = "1", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["io-util", "net", "rt-multi-thread"] }
 
 [lints]

@@ -4,7 +4,7 @@
 //! [`AsterFeed`], and the set of subscriptions. The client methods only send
 //! it commands.
 
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use ahash::AHashMap;
 use anyhow::Context;
@@ -28,6 +28,7 @@ use nautilus_core::{
     datetime::datetime_to_unix_nanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
+use nautilus_live::book::recovery::BookRecoveryState;
 use nautilus_model::{
     data::{Data, InstrumentStatus},
     enums::MarketStatusAction,
@@ -44,6 +45,7 @@ use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
 
 use crate::{
+    book::recovery::{self, SnapshotAdmission, SnapshotError, SnapshotMessage, SnapshotResult},
     common,
     config::AsterDataClientConfig,
     feed::{AsterFeed, FeedEvent},
@@ -71,25 +73,7 @@ const TRADES_PAGE: usize = 1000;
 const FUNDING_MAX_PAGES: usize = 20;
 /// The longest funding interval the venue uses, eight hours, in milliseconds.
 const FUNDING_LONGEST_MS: u64 = 8 * 60 * 60 * 1_000;
-const SNAPSHOT_RETRY_DELAY: Duration = Duration::from_secs(1);
 const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// A depth snapshot response, tagged with the request it answers.
-struct SnapshotResult {
-    symbol: Ustr,
-    /// The symbol's snapshot epoch when the request was made.
-    epoch: u64,
-    fence: Option<ReconnectFence>,
-    body: anyhow::Result<String>,
-}
-
-enum SnapshotJob {
-    Queued {
-        ready: Instant,
-        fence: Option<ReconnectFence>,
-    },
-    InFlight(JoinHandle<()>),
-}
 
 /// The background task that owns the socket and the feed.
 struct Session {
@@ -102,12 +86,9 @@ struct Session {
     clock: &'static AtomicTime,
     config: AsterDataClientConfig,
     subscriptions: Subscriptions,
-    /// Bumped whenever a book is reset, so a response to a request made
-    /// before the reset can be told apart and discarded.
-    snapshot_epochs: AHashMap<Ustr, u64>,
-    snapshot_jobs: AHashMap<Ustr, SnapshotJob>,
-    pending_snapshots: BTreeSet<(Instant, Ustr)>,
-    snapshots_tx: UnboundedSender<SnapshotResult>,
+    recoveries: AHashMap<Ustr, BookRecoveryState<SnapshotError>>,
+    pending_snapshots: VecDeque<SnapshotAdmission>,
+    snapshots_tx: UnboundedSender<SnapshotMessage>,
     cancel: CancellationToken,
     events: Vec<FeedEvent>,
     /// When the next book snapshot may be requested, to stay inside the
@@ -163,23 +144,12 @@ impl Session {
             .is_some_and(|id| self.subscriptions.wants(id, Kind::Book))
     }
 
-    /// Invalidates any snapshot request in flight for a book.
-    fn bump_snapshot_epoch(&mut self, symbol: Ustr) {
-        let epoch = self.snapshot_epochs.entry(symbol).or_insert(0);
-        *epoch = epoch.wrapping_add(1);
-    }
-
     /// Forgets a book and invalidates any snapshot request in flight for it.
     fn reset_book(&mut self, symbol: Ustr) {
         self.feed.reset_book(symbol.as_str());
-        self.bump_snapshot_epoch(symbol);
-        match self.snapshot_jobs.remove(&symbol) {
-            Some(SnapshotJob::Queued { ready, .. }) => {
-                self.pending_snapshots.remove(&(ready, symbol));
-            }
-            Some(SnapshotJob::InFlight(task)) => task.abort(),
-            None => {}
-        }
+        self.recoveries.remove(&symbol);
+        self.pending_snapshots
+            .retain(|request| request.symbol != symbol);
     }
 
     /// Applies a batch of commands with at most one message per direction.
@@ -203,62 +173,46 @@ impl Session {
         self.pool.unsubscribe(&changes.closed).await;
     }
 
-    fn queue_snapshot(&mut self, symbol: Ustr, delay: Duration) {
-        if let std::collections::hash_map::Entry::Vacant(entry) = self.snapshot_jobs.entry(symbol) {
-            let now = Instant::now();
-            let ready = now.checked_add(delay).unwrap_or(now);
-            let fence = self
-                .feed
-                .instrument_id(symbol.as_str())
-                .and_then(|id| self.pool.reconnect_fence(&Kind::Book.stream(&id)));
-            self.pending_snapshots.insert((ready, symbol));
-            entry.insert(SnapshotJob::Queued { ready, fence });
+    fn request_snapshot(&mut self, symbol: Ustr) {
+        if !self.cancel.is_cancelled()
+            && let Some(owner) = self.recoveries.entry(symbol).or_default().claim()
+        {
+            recovery::spawn(
+                symbol,
+                owner,
+                self.http.clone(),
+                self.snapshots_tx.clone(),
+                self.config.book_snapshot_depth,
+                Duration::from_secs(self.config.book_snapshot_timeout_secs),
+            );
         }
     }
 
-    fn snapshot_deadline(&self) -> Option<Instant> {
-        self.pending_snapshots
-            .first()
-            .map(|(ready, _)| (*ready).max(self.next_snapshot_at))
+    fn snapshot_fence(&self, symbol: Ustr) -> Option<ReconnectFence> {
+        let id = self.feed.instrument_id(symbol.as_str())?;
+        self.pool
+            .reconnect_fence(&Kind::Book.stream(&id))
+            .filter(ReconnectFence::is_current)
     }
 
-    fn start_snapshot(&mut self) {
-        let Some((_, symbol)) = self.pending_snapshots.pop_first() else {
-            return;
-        };
-        let Some(SnapshotJob::Queued { fence, .. }) = self.snapshot_jobs.remove(&symbol) else {
-            return;
-        };
-        if fence.as_ref().is_some_and(|fence| !fence.is_current()) {
-            return;
-        }
-        let epoch = *self.snapshot_epochs.entry(symbol).or_insert(0);
-        let http = self.http.clone();
-        let results = self.snapshots_tx.clone();
-        let depth = self.config.book_snapshot_depth;
-        let cancel = self.cancel.clone();
-        // Spend a rate-limit slot only when a request is actually started.
-        let now = Instant::now();
-        self.next_snapshot_at = now.checked_add(self.snapshot_spacing).unwrap_or(now);
-        let task = get_runtime().spawn(async move {
-            let request = async {
-                anyhow::ensure!(
-                    fence.as_ref().is_none_or(ReconnectFence::is_current),
-                    "superseded by a reconnect"
-                );
-                http.request_depth(symbol.as_str(), depth).await
-            };
-            tokio::select! {
-                biased;
-                () = cancel.cancelled() => {}
-                body = request => {
-                    // The receiver only closes when the session has ended.
-                    let _ = results.send(SnapshotResult { symbol, epoch, fence, body });
-                }
+    fn admit_snapshot(&mut self) {
+        while let Some(SnapshotAdmission {
+            symbol,
+            owner,
+            ready,
+        }) = self.pending_snapshots.pop_front()
+        {
+            if ready.is_closed() || !owner.is_running() || !self.book_wanted(symbol) {
+                continue;
             }
-        });
-        self.snapshot_jobs
-            .insert(symbol, SnapshotJob::InFlight(task));
+            let fence = self.snapshot_fence(symbol);
+            let admitted = fence.is_some();
+            if ready.send(fence).is_ok() && admitted {
+                let now = Instant::now();
+                self.next_snapshot_at = now.checked_add(self.snapshot_spacing).unwrap_or(now);
+                break;
+            }
+        }
     }
 
     fn publish(&mut self) {
@@ -267,7 +221,7 @@ impl Session {
             match event {
                 FeedEvent::SnapshotRequired(symbol) => {
                     if self.book_wanted(symbol) {
-                        self.queue_snapshot(symbol, Duration::ZERO);
+                        self.request_snapshot(symbol);
                     } else {
                         // A depth frame that was already queued when the book
                         // was unsubscribed. Forget it, so a later subscription
@@ -310,7 +264,11 @@ impl Session {
                 .filter(|id| streams.contains(&Kind::Book.stream(id)))
                 .collect();
             for instrument_id in books {
-                self.reset_book(Ustr::from(common::raw_symbol(&instrument_id)));
+                let symbol = Ustr::from(common::raw_symbol(&instrument_id));
+                self.feed.reset_book(symbol.as_str());
+                if let Some(state) = self.recoveries.get_mut(&symbol) {
+                    state.reset_on_reconnect();
+                }
             }
             return;
         }
@@ -343,46 +301,49 @@ impl Session {
     }
 
     fn on_snapshot(&mut self, result: SnapshotResult) {
+        let outcome = self.apply_snapshot(&result);
+        let _ = result.applied.send(outcome);
+    }
+
+    fn apply_snapshot(&mut self, snapshot: &SnapshotResult) -> Result<(), SnapshotError> {
         let SnapshotResult {
             symbol,
-            epoch,
+            owner,
             fence,
+            cancellation,
             body,
-        } = result;
-        if self.snapshot_epochs.get(&symbol) != Some(&epoch) {
-            // Requested before the book was last reset: it may describe a
-            // book from before a reconnect or an earlier subscription.
-            return;
-        }
-        self.snapshot_jobs.remove(&symbol);
-        if fence.as_ref().is_some_and(|fence| !fence.is_current()) {
-            // The book's connection has reconnected since the request, and
-            // its reconnect may still be queued behind this result, so the
-            // snapshot predates the gap. The reconnect resets the book and
-            // its next update schedules recovery.
-            return;
-        }
-        if !self.book_wanted(symbol) {
-            self.reset_book(symbol);
-            return;
+            ..
+        } = snapshot;
+        if !owner.is_running()
+            || cancellation.is_cancelled()
+            || !self
+                .snapshot_fence(*symbol)
+                .is_some_and(|current| fence.matches(&current))
+        {
+            return Err(SnapshotError::Obsolete);
         }
         let ts_init = self.clock.get_time_ns();
         let previous_events = self.events.len();
-        let applied = body.and_then(|body| {
+        let result =
             self.feed
-                .handle_depth_snapshot(symbol.as_str(), &body, ts_init, &mut self.events)
-        });
-        if fence.as_ref().is_some_and(|fence| !fence.is_current()) {
+                .handle_depth_snapshot(symbol.as_str(), body, ts_init, &mut self.events);
+        if cancellation.is_cancelled() || !fence.is_current() {
             // Decoding a large snapshot and its buffered suffix takes time.
             self.events.truncate(previous_events);
-            self.reset_book(symbol);
-            return;
+            self.feed.reset_book(symbol.as_str());
+            return Err(SnapshotError::Obsolete);
         }
-        if let Err(error) = applied {
-            log::warn!("Aster book snapshot for {symbol} failed, retrying: {error:#}");
-            self.queue_snapshot(symbol, SNAPSHOT_RETRY_DELAY);
-        }
+        let result = result
+            .map_err(|error| SnapshotError::Retryable(format!("{error:#}")))
+            .and_then(|()| {
+                if self.feed.is_book_live(symbol.as_str()) && owner.accept() {
+                    Ok(())
+                } else {
+                    Err(SnapshotError::Unbridged)
+                }
+            });
         self.publish();
+        result
     }
 
     async fn on_message(&mut self, (slot, ts_init, message): PoolFrame) {
@@ -424,7 +385,7 @@ impl Session {
         mut self,
         mut frames: UnboundedReceiver<PoolFrame>,
         mut commands: UnboundedReceiver<Command>,
-        mut snapshots: UnboundedReceiver<SnapshotResult>,
+        mut snapshots: UnboundedReceiver<SnapshotMessage>,
         mut updates: UnboundedReceiver<InstrumentUpdate>,
     ) {
         let mut retry = tokio::time::interval(SUBSCRIBE_RETRY_INTERVAL);
@@ -436,7 +397,8 @@ impl Session {
         let mut armed_snapshot = None;
         let mut oldest_frame: Option<PoolFrame> = None;
         loop {
-            let snapshot_deadline = self.snapshot_deadline();
+            let snapshot_deadline =
+                (!self.pending_snapshots.is_empty()).then_some(self.next_snapshot_at);
             if snapshot_deadline != armed_snapshot {
                 if let Some(deadline) = snapshot_deadline {
                     snapshot_timer.as_mut().reset(deadline);
@@ -470,7 +432,8 @@ impl Session {
                     log::info!(
                         "Aster ingress backlog frames={count} bytes_estimate={bytes} oldest_ms={age_ms} \
                          pending_book_bytes={} snapshot_jobs={}",
-                        self.feed.buffered_depth_bytes(), self.snapshot_jobs.len()
+                        self.feed.buffered_depth_bytes(),
+                        self.recoveries.values().filter(|state| state.is_running()).count()
                     );
                 }
                 _ = retry.tick(), if !self.unplaced.is_empty() => {
@@ -484,7 +447,10 @@ impl Session {
                     }
                     self.apply(&batch).await;
                 }
-                Some(result) = snapshots.recv() => self.on_snapshot(result),
+                Some(message) = snapshots.recv() => match message {
+                    SnapshotMessage::Admit(request) => self.pending_snapshots.push_back(request),
+                    SnapshotMessage::Apply(result) => self.on_snapshot(result),
+                },
                 Some(update) = updates.recv() => {
                     for instrument in &update.instruments {
                         self.feed.add_instrument(instrument);
@@ -496,7 +462,7 @@ impl Session {
                         self.feed.replace_funding_intervals(intervals);
                     }
                 }
-                () = &mut snapshot_timer, if armed_snapshot.is_some() => self.start_snapshot(),
+                () = &mut snapshot_timer, if armed_snapshot.is_some() => self.admit_snapshot(),
                 frame = async {
                     if let Some(frame) = oldest_frame.take() { Some(frame) } else { frames.recv().await }
                 } => match frame {
@@ -505,6 +471,7 @@ impl Session {
                 },
             }
         }
+        self.recoveries.clear();
         self.pool.close().await;
     }
 }
@@ -726,6 +693,31 @@ impl AsterDataClient {
             .with_context(|| format!("unknown Aster instrument {instrument_id}"))
     }
 
+    fn request_instrument_definitions(
+        &self,
+        into_response: impl FnOnce(Vec<InstrumentAny>, UnixNanos) -> anyhow::Result<DataResponse>
+        + Send
+        + 'static,
+    ) {
+        let http = self.http.clone();
+        let sender = self.sender.clone();
+        let clock = self.clock;
+        get_runtime().spawn(async move {
+            let response = http
+                .request_instruments(clock.get_time_ns())
+                .await
+                .and_then(|parsed| into_response(parsed.instruments, clock.get_time_ns()));
+            match response {
+                Ok(response) => {
+                    if let Err(error) = sender.send(DataEvent::Response(response)) {
+                        log::error!("Aster failed to send instrument response: {error}");
+                    }
+                }
+                Err(error) => log::error!("Aster instrument request failed: {error:#}"),
+            }
+        });
+    }
+
     fn send(&self, command: Command) -> anyhow::Result<()> {
         self.session
             .as_ref()
@@ -873,9 +865,8 @@ impl DataClient for AsterDataClient {
                 self.config.max_streams_per_connection,
                 self.config.max_connections,
             )),
-            snapshot_epochs: AHashMap::new(),
-            snapshot_jobs: AHashMap::new(),
-            pending_snapshots: BTreeSet::new(),
+            recoveries: AHashMap::new(),
+            pending_snapshots: VecDeque::new(),
             snapshots_tx,
             cancel: cancel.clone(),
             events: Vec::new(),
@@ -970,38 +961,42 @@ impl DataClient for AsterDataClient {
     }
 
     fn request_instruments(&self, request: RequestInstruments) -> anyhow::Result<()> {
-        let instruments: Vec<InstrumentAny> = self.instruments.load().values().cloned().collect();
-        let response = DataResponse::Instruments(InstrumentsResponse::new(
-            request.request_id,
-            request.client_id.unwrap_or(self.client_id),
-            common::venue(),
-            instruments,
-            datetime_to_unix_nanos(request.start),
-            datetime_to_unix_nanos(request.end),
-            self.clock.get_time_ns(),
-            request.params,
-        ));
-        self.sender
-            .send(DataEvent::Response(response))
-            .map_err(|error| anyhow::anyhow!("failed to send instruments response: {error}"))
+        let client_id = request.client_id.unwrap_or(self.client_id);
+        self.request_instrument_definitions(move |instruments, ts_init| {
+            Ok(DataResponse::Instruments(InstrumentsResponse::new(
+                request.request_id,
+                client_id,
+                common::venue(),
+                instruments,
+                datetime_to_unix_nanos(request.start),
+                datetime_to_unix_nanos(request.end),
+                ts_init,
+                request.params,
+            )))
+        });
+        Ok(())
     }
 
     fn request_instrument(&self, request: RequestInstrument) -> anyhow::Result<()> {
         let instrument_id = request.single_instrument_id()?;
-        let instrument = self.instrument(instrument_id)?;
-        let response = DataResponse::Instrument(Box::new(InstrumentResponse::new(
-            request.request_id,
-            request.client_id.unwrap_or(self.client_id),
-            instrument_id,
-            instrument,
-            datetime_to_unix_nanos(request.start),
-            datetime_to_unix_nanos(request.end),
-            self.clock.get_time_ns(),
-            request.params,
-        )));
-        self.sender
-            .send(DataEvent::Response(response))
-            .map_err(|error| anyhow::anyhow!("failed to send instrument response: {error}"))
+        let client_id = request.client_id.unwrap_or(self.client_id);
+        self.request_instrument_definitions(move |instruments, ts_init| {
+            let instrument = instruments
+                .into_iter()
+                .find(|instrument| instrument.id() == instrument_id)
+                .with_context(|| format!("unknown Aster instrument {instrument_id}"))?;
+            Ok(DataResponse::Instrument(Box::new(InstrumentResponse::new(
+                request.request_id,
+                client_id,
+                instrument_id,
+                instrument,
+                datetime_to_unix_nanos(request.start),
+                datetime_to_unix_nanos(request.end),
+                ts_init,
+                request.params,
+            ))))
+        });
+        Ok(())
     }
 
     /// Returns the most recent individual trades inside the request's window.

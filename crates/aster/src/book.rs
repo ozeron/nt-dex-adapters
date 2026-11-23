@@ -7,6 +7,11 @@ use std::collections::VecDeque;
 
 use nautilus_model::data::OrderBookDeltas;
 
+pub(crate) mod recovery;
+
+#[cfg(test)]
+mod model;
+
 /// A depth diff with the IDs needed to sequence it.
 #[derive(Debug)]
 pub struct DepthDiff<T = OrderBookDeltas> {

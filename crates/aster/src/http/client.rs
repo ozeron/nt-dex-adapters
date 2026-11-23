@@ -2,9 +2,10 @@
 
 use anyhow::Context;
 use nautilus_core::UnixNanos;
-use nautilus_network::http::HttpClient;
+use nautilus_network::http::{HttpClient, HttpResponse};
 
 use super::parse::{ParsedInstruments, parse_exchange_info, parse_funding_intervals};
+use crate::book::recovery::SnapshotError;
 
 /// Fetches public market data over REST.
 #[derive(Clone, Debug)]
@@ -30,13 +31,16 @@ impl AsterHttpClient {
         })
     }
 
-    async fn get(&self, path: &str) -> anyhow::Result<String> {
+    async fn fetch(&self, path: &str) -> anyhow::Result<HttpResponse> {
         let url = format!("{}{path}", self.base_url);
-        let response = self
-            .inner
+        self.inner
             .get(url, None, None, None, None)
             .await
-            .with_context(|| format!("GET {path} failed"))?;
+            .with_context(|| format!("GET {path} failed"))
+    }
+
+    async fn get(&self, path: &str) -> anyhow::Result<String> {
+        let response = self.fetch(path).await?;
         let body = String::from_utf8_lossy(&response.body);
         anyhow::ensure!(
             response.status.is_success(),
@@ -106,7 +110,50 @@ impl AsterHttpClient {
     ///
     /// Returns an error if the request fails.
     pub async fn request_depth(&self, raw_symbol: &str, limit: u16) -> anyhow::Result<String> {
-        self.get(&format!("/fapi/v1/depth?symbol={raw_symbol}&limit={limit}"))
+        self.get(&depth_path(raw_symbol, limit)).await
+    }
+
+    pub(crate) async fn fetch_depth(
+        &self,
+        raw_symbol: &str,
+        limit: u16,
+    ) -> Result<String, SnapshotError> {
+        let path = depth_path(raw_symbol, limit);
+        let response = self
+            .fetch(&path)
             .await
+            .map_err(|error| SnapshotError::Retryable(format!("{error:#}")))?;
+        let body = String::from_utf8_lossy(&response.body);
+        if response.status.is_success() {
+            return Ok(body.into_owned());
+        }
+        let message = format!("GET {path} returned {:?}: {body}", response.status);
+        match response.status.as_u16() {
+            408 | 418 | 425 | 429 | 500..=599 => Err(SnapshotError::Retryable(message)),
+            _ => Err(SnapshotError::Permanent(message)),
+        }
+    }
+}
+
+fn depth_path(raw_symbol: &str, limit: u16) -> String {
+    format!("/fapi/v1/depth?symbol={raw_symbol}&limit={limit}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AsterHttpClient;
+
+    #[tokio::test]
+    async fn request_depth_preserves_transport_error_context() -> anyhow::Result<()> {
+        let client = AsterHttpClient::new("://", 1)?;
+        let Err(error) = client.request_depth("SOLUSDT", 5).await else {
+            anyhow::bail!("an invalid base URL must fail");
+        };
+        assert_eq!(
+            error.to_string(),
+            "GET /fapi/v1/depth?symbol=SOLUSDT&limit=5 failed"
+        );
+        assert!(error.chain().nth(1).is_some());
+        Ok(())
     }
 }
