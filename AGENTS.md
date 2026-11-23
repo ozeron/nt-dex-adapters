@@ -1,6 +1,6 @@
 # Adapter development
 
-Build one public market-data adapter at a time. Start with Aster and hand-review it before using it as the reference for GRVT, edgeX, or Extended. Keep strategies in the separate private repository. Use NautilusTrader's streaming catalog for decoded market data.
+Build one public market-data adapter at a time. Start with Aster and hand-review it before using it as the reference for later venues. Follow the venue order in the README. Keep strategies in the separate private repository. Use NautilusTrader's streaming catalog for decoded market data.
 
 ## Per-venue checklist
 

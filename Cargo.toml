@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/aster",
+    "crates/ondo-perps",
     "bins/node",
     "tools/capture",
     "tools/rust-comments",
