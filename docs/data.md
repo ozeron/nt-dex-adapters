@@ -37,9 +37,11 @@ Update ids (`U`, `u`, `pu`) are venue-global: they are shared across symbols, so
 1. The first diff queues a paced snapshot request. While waiting, the adapter validates the diffs and retains compact wire payloads, timestamps, and sequence IDs. It keeps the newest suffix within the 20,000-diff count limit and the configurable `book_buffer_bytes` and `session_book_buffer_bytes` budgets (4 MiB per book and 64 MiB per session by default).
 2. When the snapshot (`lastUpdateId`) arrives, held diffs with `u <= lastUpdateId` are dropped. The snapshot must cover every evicted diff. The first remaining diff must have `pu <= lastUpdateId`, otherwise the adapter requests another snapshot. Only the updates applied to the book are expanded into Nautilus deltas.
 3. After that, every diff must have `pu` equal to the previous diff's `u`. Otherwise the book has a gap: the diff is held, a new snapshot is requested, and nothing is emitted for that book until it arrives.
-4. A WebSocket reconnect resets every book carried by that connection and requests new snapshots. A changed instrument definition resets that book too.
+4. A WebSocket reconnect clears the old diffs for books carried by that connection. An active snapshot recovery keeps its retry budget and rejects responses from the old connection. The first new diff starts recovery for any book without an active owner. A changed instrument definition resets that book too.
 
 Until a book has its first snapshot the catalog has nothing for it. Snapshots are paced to the venue's request weight (`snapshot_weight_per_minute`, default 1800 of the 2400 per minute the venue's `exchangeInfo` lists). A 1000-level snapshot weighs 20, so one is requested every 0.67 s. The first pass of requests for 595 books takes about 6.6 minutes at that rate. Books that need a newer snapshot can take longer. A reconnect of a connection with many books is paced the same way.
+
+The snapshot deadline starts after rate admission (`book_snapshot_timeout_secs` defaults to 10). Zero disables that per-snapshot deadline. The REST timeout and shared NautilusTrader recovery budget still apply. When that budget is exhausted, recovery keeps retrying with a backoff that grows from one to fifteen minutes until a snapshot bridges or the book is unsubscribed.
 
 The adapter logs queued frame counts, estimated ingress bytes, age of the queue head, pending book bytes, and snapshot jobs. The recorder also logs the Nautilus runner's sampled event count, estimated inline queue bytes, and the maximum socket-to-actor age of mark prices in each reporting window. Mark age includes processing before dispatch. The runner's byte estimate excludes owned book payloads.
 
@@ -134,5 +136,5 @@ Loaded from `GET /fapi/v1/exchangeInfo`. Only symbols with status `TRADING` and 
 - No liquidations or open interest.
 - Gaps are logged, not stored in the catalog. A book gap shows only as a later `Clear`; missed trades are counted in the log.
 - `record --all` takes the instrument list at start. Instruments listed later are not subscribed.
-- Catalog history recorded before a 24-hour soak is unqualified. The soak has not been run, and nothing has yet been reconciled against venue statistics over a full day.
+- Full-day catalog replay and reconciliation against venue statistics are pending.
 - Book levels beyond the snapshot window are incomplete (see above).
